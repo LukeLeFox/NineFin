@@ -1,0 +1,24 @@
+# Theos build output
+.theos/
+obj/
+packages/
+
+# Built applications and packages
+*.app/
+*.dSYM/
+*.ipa
+*.deb
+
+# Local build logs and temporary dependency files
+*.log
+*.Td
+
+# Local backups and editor leftovers
+backup*/
+*.bak
+*.orig
+*.pre-*
+*~
+
+# Platform metadata
+.DS_Store

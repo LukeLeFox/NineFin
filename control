@@ -1,0 +1,8 @@
+Package: dev.luke.ninefin
+Name: NineFin
+Version: 0.7.1
+Architecture: iphoneos-arm
+Maintainer: Luke
+Author: Luke
+Section: Applications
+Description: Native iOS 9 application - NineFin
