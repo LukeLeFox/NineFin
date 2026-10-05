@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NineFin — Jellyfin client for legacy iOS 9</title>
+  <meta name="description" content="NineFin is a native Jellyfin client for legacy iOS 9 devices, including ARMv7 iPhone and iPad hardware. Download a ready-to-install IPA or build it with Theos.">
+  <meta name="keywords" content="NineFin, Jellyfin, iOS 9, Jellyfin iOS 9, Jellyfin iPhone 4S, Jellyfin IPA, legacy iOS, ARMv7, old iPhone, old iPad, Theos">
+  <meta name="robots" content="index,follow">
+  <link rel="canonical" href="https://lukelefox.github.io/NineFin/">
+
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="NineFin — Jellyfin client for legacy iOS 9">
+  <meta property="og:description" content="Native Jellyfin client for legacy iPhone and iPad devices running iOS 9. Prebuilt IPA releases available.">
+  <meta property="og:url" content="https://lukelefox.github.io/NineFin/">
+  <meta property="og:image" content="https://raw.githubusercontent.com/LukeLeFox/NineFin/main/Resources/Icon-76%402x.png">
+
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NineFin — Jellyfin client for legacy iOS 9">
+  <meta name="twitter:description" content="Native Jellyfin client for legacy iOS 9 / ARMv7 devices with ready-to-install IPA releases.">
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "NineFin",
+    "applicationCategory": "MultimediaApplication",
+    "operatingSystem": "iOS 9",
+    "softwareVersion": "0.7.2",
+    "description": "Native Jellyfin client for legacy iOS 9 devices, including ARMv7 iPhone and iPad hardware.",
+    "url": "https://lukelefox.github.io/NineFin/",
+    "downloadUrl": "https://github.com/LukeLeFox/NineFin/releases/latest",
+    "codeRepository": "https://github.com/LukeLeFox/NineFin",
+    "license": "https://opensource.org/license/mit",
+    "author": {
+      "@type": "Person",
+      "name": "LukeLeFox"
+    }
+  }
+  </script>
+
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0e131b;
+      color: #f4f7fb;
+      line-height: 1.6;
+    }
+    main {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 56px 24px 80px;
+    }
+    .hero {
+      display: flex;
+      gap: 24px;
+      align-items: center;
+      margin-bottom: 38px;
+    }
+    .icon {
+      width: 112px;
+      height: 112px;
+      border-radius: 24px;
+      flex: 0 0 auto;
+    }
+    h1 { margin: 0 0 8px; font-size: 2.35rem; line-height: 1.1; }
+    h2 { margin-top: 42px; }
+    .tagline { color: #b8c2d0; font-size: 1.1rem; margin: 0; }
+    .buttons { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 24px; }
+    .button {
+      display: inline-block;
+      padding: 11px 17px;
+      border-radius: 9px;
+      text-decoration: none;
+      font-weight: 700;
+      background: #2bc1d2;
+      color: #061116;
+    }
+    .button.secondary { background: #232c3a; color: #f4f7fb; }
+    .card {
+      background: #151d28;
+      border: 1px solid #263244;
+      border-radius: 14px;
+      padding: 20px;
+      margin: 18px 0;
+    }
+    code { background: #1e2835; padding: 2px 6px; border-radius: 5px; }
+    a { color: #63d6e3; }
+    footer { color: #8793a3; margin-top: 48px; font-size: .92rem; }
+    @media (max-width: 600px) {
+      .hero { align-items: flex-start; }
+      .icon { width: 84px; height: 84px; border-radius: 19px; }
+      h1 { font-size: 1.85rem; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <img class="icon" src="https://raw.githubusercontent.com/LukeLeFox/NineFin/main/Resources/Icon-76%402x.png" alt="NineFin app icon">
+      <div>
+        <h1>NineFin</h1>
+        <p class="tagline">A native Jellyfin client for legacy iOS 9 devices.</p>
+        <div class="buttons">
+          <a class="button" href="https://github.com/LukeLeFox/NineFin/releases/latest">Download IPA</a>
+          <a class="button secondary" href="https://github.com/LukeLeFox/NineFin">View source on GitHub</a>
+        </div>
+      </div>
+    </section>
+
+    <div class="card">
+      <strong>Ready-to-install IPA available.</strong>
+      NineFin releases include a prebuilt IPA for users who do not want to compile the app themselves.
+    </div>
+
+    <h2>Jellyfin on old iPhone and iPad hardware</h2>
+    <p>
+      NineFin is built specifically for legacy Apple devices running iOS 9.
+      It targets 32-bit ARMv7 hardware and provides a native Jellyfin experience
+      for devices such as the iPhone 4S and older iPads.
+    </p>
+
+    <h2>Features</h2>
+    <ul>
+      <li>Jellyfin login with Keychain-backed sessions</li>
+      <li>Multiple servers</li>
+      <li>Continue Watching and Next Up</li>
+      <li>Movies, TV shows, seasons and episodes</li>
+      <li>Global search and favorites</li>
+      <li>Native HLS playback</li>
+      <li>Playback progress synchronization</li>
+      <li>Audio and subtitle selection</li>
+      <li>Configurable streaming quality</li>
+    </ul>
+
+    <h2>Compatibility</h2>
+    <ul>
+      <li>iOS 9.0 or newer within the legacy ARMv7 target</li>
+      <li>32-bit ARMv7</li>
+      <li>iPhone and iPad</li>
+      <li>IPA package format</li>
+    </ul>
+
+    <h2>Download NineFin</h2>
+    <p>
+      The latest tested build is available from
+      <a href="https://github.com/LukeLeFox/NineFin/releases/latest">GitHub Releases</a>.
+      The current release includes a precompiled <code>.ipa</code> file.
+    </p>
+
+    <h2>Build from source</h2>
+    <p>
+      Developers can build NineFin using Objective-C, Theos and an iOS 9.2 SDK.
+      Source code is available in the
+      <a href="https://github.com/LukeLeFox/NineFin">NineFin GitHub repository</a>.
+    </p>
+
+    <footer>
+      NineFin is an independent community project and is not affiliated with or endorsed by Jellyfin.
+      Released under the MIT License.
+    </footer>
+  </main>
+</body>
+</html>
