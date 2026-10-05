@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://lukelefox.github.io/NineFin/sitemap.xml
