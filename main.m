@@ -312,7 +312,7 @@ static void NFHeaders(NSMutableURLRequest *r) {
         stringWithFormat:
         @"MediaBrowser Client=\"NineFin\", "
          "Device=\"iPhone iOS9\", "
-         "DeviceId=\"%@\", Version=\"0.7.1\"",
+         "DeviceId=\"%@\", Version=\"0.7.2\"",
         NFDevice()];
 
     if (NFToken.length) {
@@ -442,6 +442,11 @@ static void NFAlert(UIViewController *vc,
 @property (strong, nonatomic) id progressObserver;
 @property (assign, nonatomic) BOOL didStart;
 @property (assign, nonatomic) BOOL didStop;
+@property (assign, nonatomic) BOOL observingPlaybackEnd;
+
+- (void)stopResumeObservation;
+- (void)stopPlaybackEndObservation;
+- (void)markItemPlayed;
 @end
 
 @interface NFLibraryController : UITableViewController
@@ -1167,7 +1172,8 @@ static void *NFResumeContext = &NFResumeContext;
     return @(ticks);
 }
 
-- (void)report:(NSString *)endpoint {
+- (void)report:(NSString *)endpoint
+          completion:(void (^)(void))completion {
     if (!self.itemId.length) return;
 
     NSMutableDictionary *body = [@{
@@ -1196,11 +1202,110 @@ static void *NFResumeContext = &NFResumeContext;
                 NSLog(@"NineFin playback report failed: %@ (%ld)",
                     endpoint, (long)error.code);
             }
+
+            if (completion)
+                completion();
         });
+}
+
+- (void)report:(NSString *)endpoint {
+    [self report:endpoint completion:nil];
+}
+
+- (void)markItemPlayed {
+    NSString *itemId = [self.itemId copy];
+    NSString *user = [NFUser copy];
+
+    if (!itemId.length)
+        return;
+
+    NSString *path = [NSString stringWithFormat:
+        @"/UserPlayedItems/%@", itemId];
+
+    NFRequest(path, @"POST", nil,
+        ^(id result, NSError *error) {
+
+        if (!error) {
+            NSLog(@"NineFin playback completed: %@ marked played",
+                itemId);
+            return;
+        }
+
+        if (error.code == 404 && user.length) {
+            NSString *legacy = [NSString stringWithFormat:
+                @"/Users/%@/PlayedItems/%@", user, itemId];
+
+            NFRequest(legacy, @"POST", nil,
+                ^(id legacyResult, NSError *legacyError) {
+                    if (legacyError) {
+                        NSLog(
+                            @"NineFin MarkPlayed legacy failed: %@",
+                            legacyError);
+                    } else {
+                        NSLog(
+                            @"NineFin playback completed "
+                            @"using legacy MarkPlayed");
+                    }
+                });
+
+            return;
+        }
+
+        NSLog(@"NineFin MarkPlayed failed: %@", error);
+    });
+}
+
+- (void)stopPlaybackEndObservation {
+    if (!self.observingPlaybackEnd)
+        return;
+
+    [[NSNotificationCenter defaultCenter]
+        removeObserver:self
+        name:AVPlayerItemDidPlayToEndTimeNotification
+        object:nil];
+
+    self.observingPlaybackEnd = NO;
+}
+
+- (void)playbackDidEnd:(NSNotification *)notification {
+    if (self.didStop)
+        return;
+
+    if (notification.object != self.player.currentItem)
+        return;
+
+    NSLog(@"NineFin: playback reached natural end");
+
+    self.didStop = YES;
+
+    [self stopResumeObservation];
+    [self stopPlaybackEndObservation];
+
+    if (self.progressObserver) {
+        [self.player removeTimeObserver:self.progressObserver];
+        self.progressObserver = nil;
+    }
+
+    [self report:@"/Sessions/Playing/Stopped"
+        completion:^{
+            [self markItemPlayed];
+        }];
 }
 
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
+
+    if (!self.observingPlaybackEnd &&
+        self.player.currentItem) {
+
+        [[NSNotificationCenter defaultCenter]
+            addObserver:self
+            selector:@selector(playbackDidEnd:)
+            name:AVPlayerItemDidPlayToEndTimeNotification
+            object:self.player.currentItem];
+
+        self.observingPlaybackEnd = YES;
+    }
 
     if (self.resumeTicks > 0 &&
         !self.observingResume &&
@@ -1298,7 +1403,9 @@ static void *NFResumeContext = &NFResumeContext;
 
 - (void)viewWillDisappear:(BOOL)animated {
     [super viewWillDisappear:animated];
+
     [self stopResumeObservation];
+    [self stopPlaybackEndObservation];
 
     if (!self.didStart || self.didStop) return;
     self.didStop = YES;
@@ -1315,6 +1422,8 @@ static void *NFResumeContext = &NFResumeContext;
 
 - (void)dealloc {
     [self stopResumeObservation];
+    [self stopPlaybackEndObservation];
+
     if (self.progressObserver && self.player) {
         [self.player removeTimeObserver:self.progressObserver];
         self.progressObserver = nil;
@@ -1598,7 +1707,44 @@ static void NFPoster(NSString *itemId, UIImageView *view) {
             return;
         }
 
-        self.resumeItems = [self extractItems:result];
+        NSArray *items = [self extractItems:result];
+
+        NSMutableArray *filtered =
+            [NSMutableArray arrayWithCapacity:items.count];
+
+        for (NSDictionary *item in items) {
+            NSDictionary *userData =
+                [item[@"UserData"]
+                    isKindOfClass:[NSDictionary class]]
+                    ? item[@"UserData"] : nil;
+
+            id playedValue = userData[@"Played"];
+            id positionValue =
+                userData[@"PlaybackPositionTicks"];
+
+            BOOL played =
+                [playedValue respondsToSelector:
+                    @selector(boolValue)]
+                    ? [playedValue boolValue]
+                    : NO;
+
+            long long position =
+                [positionValue respondsToSelector:
+                    @selector(longLongValue)]
+                    ? [positionValue longLongValue]
+                    : 0;
+
+            if (played && position <= 0) {
+                NSLog(
+                    @"NineFin Resume: filtered zombie item %@",
+                    item[@"Id"] ?: @"unknown");
+                continue;
+            }
+
+            [filtered addObject:item];
+        }
+
+        self.resumeItems = filtered;
         [self renderResume];
     });
 }
