@@ -5,9 +5,9 @@ It is written in Objective-C with Theos and targets 32-bit ARMv7 devices such as
 
 NineFin is designed for people who want to keep using Jellyfin on legacy iOS hardware without relying on a modern browser or a current App Store client.
 
-## Download ready-to-install IPA
+## Download prebuilt IPA
 
-Prebuilt IPA files are provided in the GitHub Releases section, so you do **not** need to compile NineFin yourself if you only want to install and use the app.
+Prebuilt IPA files are provided in the GitHub Releases section, so you do **not** need to compile NineFin yourself if you only want to install the app.
 
 **Latest release:** https://github.com/LukeLeFox/NineFin/releases/latest
 
@@ -17,9 +17,9 @@ Current tested release:
 - Bundle ID: `dev.luke.ninefin`
 - iOS 9.0+
 - ARMv7
-- Ready-to-install IPA included in the release assets
+- Prebuilt IPA included in the release assets
 
-> Installation of unsigned or custom IPA files generally requires a jailbroken device, AppSync, or another compatible sideloading method.
+> On legacy iOS 9 hardware, installation requires a compatible IPA sideload method. A jailbroken device with AppSync Unified is the recommended setup used during NineFin testing.
 
 ## Features
 
