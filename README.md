@@ -1,4 +1,4 @@
-# NineFin
+# NineFin — Jellyfin client for legacy iOS 9
 
 NineFin is a native Jellyfin client for legacy iPhone and iPad devices running
 iOS 9. It is built with Objective-C and Theos and targets 32-bit ARMv7 devices.
