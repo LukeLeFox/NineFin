@@ -21,6 +21,16 @@ Current tested release:
 
 > On legacy iOS 9 hardware, installation requires a compatible IPA sideload method. A jailbroken device with AppSync Unified is the recommended setup used during NineFin testing.
 
+## Screenshots
+
+| Home and Continue Watching | Library navigation |
+|---|---|
+| ![NineFin home screen](docs/screenshots/ninefin-home.png) | ![NineFin library side menu](docs/screenshots/ninefin-library-menu.png) |
+| Server management | Add-server dialog |
+| ![NineFin saved server list](docs/screenshots/ninefin-server-list.png) | ![NineFin add-server dialog](docs/screenshots/ninefin-server-dialog.png) |
+
+The screenshots use documentation-only network addresses and contain no private server details.
+
 ## Features
 
 - Jellyfin server login with credentials and sessions stored in the iOS Keychain
