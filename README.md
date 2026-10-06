@@ -13,13 +13,13 @@ Prebuilt IPA files are provided in the GitHub Releases section, so you do **not*
 
 Current public release:
 
-- NineFin 0.7.2
+- NineFin 0.7.3
 - Bundle ID: `dev.luke.ninefin`
 - iOS 9.0+
 - ARMv7
 - Prebuilt IPA included in the release assets
 
-The `main` branch now contains NineFin 0.7.3, the offline playback and synchronization update. Its prebuilt IPA is being prepared in a draft GitHub Release and will become the latest download when that release is published.
+NineFin 0.7.3 is the current offline playback and synchronization release. Its prebuilt IPA is available from the latest GitHub Release.
 
 > On legacy iOS 9 hardware, installation requires a compatible IPA sideload method. A jailbroken device with AppSync Unified is the recommended setup used during NineFin testing.
 
