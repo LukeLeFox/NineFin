@@ -11,13 +11,15 @@ Prebuilt IPA files are provided in the GitHub Releases section, so you do **not*
 
 **Latest release:** https://github.com/LukeLeFox/NineFin/releases/latest
 
-Current tested release:
+Current public release:
 
 - NineFin 0.7.2
 - Bundle ID: `dev.luke.ninefin`
 - iOS 9.0+
 - ARMv7
 - Prebuilt IPA included in the release assets
+
+The `main` branch now contains NineFin 0.7.3, the offline playback and synchronization update. Its prebuilt IPA is being prepared in a draft GitHub Release and will become the latest download when that release is published.
 
 > On legacy iOS 9 hardware, installation requires a compatible IPA sideload method. A jailbroken device with AppSync Unified is the recommended setup used during NineFin testing.
 
@@ -40,8 +42,24 @@ The screenshots use documentation-only network addresses and contain no private 
 - Native HLS playback with configurable streaming quality
 - Playback progress synchronization with Jellyfin
 - Correct playback-completion reporting and watched-state handling
+- Downloads for offline playback, managed directly from an item's detail screen
+- A dedicated Downloads library with active-transfer progress and local storage controls
+- Offline resume and watched-state tracking, queued safely while the server is unavailable
+- Explicit online synchronization with conflict handling for server progress and completed items
 - Audio-track and subtitle selection
 - iPhone and iPad icon assets for iOS 9
+
+## Offline playback and synchronization
+
+NineFin 0.7.3 adds a complete offline workflow for legacy devices:
+
+- Download a movie or episode over an authenticated Jellyfin session
+- Play downloaded media without a network connection
+- Resume locally and mark playback as completed while offline
+- Review or remove saved media from the **Downloads** screen
+- Return online and synchronize queued progress with the same Jellyfin server and user account
+
+When both the server and the offline device have newer playback information, NineFin resolves the state conservatively: completed items stay completed, server progress that is already ahead is preserved, and pending local progress is retained when it cannot be synchronized safely.
 
 ## Compatibility
 

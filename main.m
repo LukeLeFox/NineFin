@@ -1,8 +1,12 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
+#import <SystemConfiguration/SystemConfiguration.h>
+#import <netinet/in.h>
 #import <AVFoundation/AVFoundation.h>
 #import <AVKit/AVKit.h>
+#import "NFDownloadManager.h"
+#import "NFDownloadsController.h"
 
 static NSString *NFServer;
 static NSString *NFToken;
@@ -50,6 +54,50 @@ static UIColor *NFSecondary(void) {
 
 
 typedef void (^NFResult)(id result, NSError *error);
+
+static BOOL NFNetworkRouteAvailable(void) {
+    struct sockaddr_in zeroAddress;
+    memset(&zeroAddress, 0, sizeof(zeroAddress));
+
+    zeroAddress.sin_len =
+        sizeof(zeroAddress);
+
+    zeroAddress.sin_family =
+        AF_INET;
+
+    SCNetworkReachabilityRef reachability =
+        SCNetworkReachabilityCreateWithAddress(
+            NULL,
+            (const struct sockaddr *)&zeroAddress);
+
+    if (!reachability)
+        return NO;
+
+    SCNetworkReachabilityFlags flags = 0;
+
+    BOOL gotFlags =
+        SCNetworkReachabilityGetFlags(
+            reachability,
+            &flags);
+
+    CFRelease(reachability);
+
+    if (!gotFlags)
+        return NO;
+
+    BOOL reachable =
+        (flags &
+         kSCNetworkReachabilityFlagsReachable)
+            != 0;
+
+    BOOL connectionRequired =
+        (flags &
+         kSCNetworkReachabilityFlagsConnectionRequired)
+            != 0;
+
+    return reachable && !connectionRequired;
+}
+
 
 static NSString *NFDevice(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
@@ -312,7 +360,7 @@ static void NFHeaders(NSMutableURLRequest *r) {
         stringWithFormat:
         @"MediaBrowser Client=\"NineFin\", "
          "Device=\"iPhone iOS9\", "
-         "DeviceId=\"%@\", Version=\"0.7.2\"",
+         "DeviceId=\"%@\", Version=\"0.7.3\"",
         NFDevice()];
 
     if (NFToken.length) {
@@ -395,6 +443,719 @@ static void NFRequest(NSString *path, NSString *method,
     }] resume];
 }
 
+
+static NSArray * __attribute__((unused))
+NFPendingOfflineSyncEntries(void) {
+
+    NSDictionary *all =
+        [[NSUserDefaults standardUserDefaults]
+            dictionaryRepresentation];
+
+    NSMutableArray *entries =
+        [NSMutableArray array];
+
+    NSString *prefix =
+        @"NineFin.DownloadMeta.";
+
+    for (NSString *key in all) {
+
+        if (![key hasPrefix:prefix])
+            continue;
+
+        id value = all[key];
+
+        if (![value isKindOfClass:
+                [NSDictionary class]])
+            continue;
+
+        NSDictionary *meta =
+            (NSDictionary *)value;
+
+        if (![meta[@"offlineDirty"] boolValue])
+            continue;
+
+        [entries addObject:@{
+            @"key": key,
+            @"meta": meta
+        }];
+    }
+
+    return entries;
+}
+
+
+static void __attribute__((unused))
+NFClearOfflinePending(NSString *key) {
+
+    if (!key.length)
+        return;
+
+    NSUserDefaults *defaults =
+        [NSUserDefaults standardUserDefaults];
+
+    NSDictionary *old =
+        [defaults dictionaryForKey:key];
+
+    if (![old isKindOfClass:
+            [NSDictionary class]])
+        return;
+
+    NSMutableDictionary *meta =
+        [old mutableCopy];
+
+    [meta removeObjectForKey:
+        @"offlineDirty"];
+
+    [meta removeObjectForKey:
+        @"offlinePositionTicks"];
+
+    [meta removeObjectForKey:
+        @"offlinePlayed"];
+
+    [meta removeObjectForKey:
+        @"offlineUpdatedAt"];
+
+    [defaults setObject:meta
+        forKey:key];
+
+    [defaults synchronize];
+}
+
+
+
+static void __attribute__((unused))
+NFOfflineSyncOne(
+    NSDictionary *entry,
+    void (^completion)(BOOL synced, BOOL resolved)) {
+
+    if (![entry isKindOfClass:
+            [NSDictionary class]]) {
+
+        if (completion)
+            completion(NO, NO);
+
+        return;
+    }
+
+
+    NSString *key =
+        entry[@"key"];
+
+    NSDictionary *meta =
+        entry[@"meta"];
+
+    if (![key isKindOfClass:
+            [NSString class]] ||
+        ![meta isKindOfClass:
+            [NSDictionary class]]) {
+
+        if (completion)
+            completion(NO, NO);
+
+        return;
+    }
+
+
+    NSString *itemId =
+        meta[@"itemId"];
+
+    NSString *server =
+        meta[@"server"];
+
+    NSString *user =
+        meta[@"user"];
+
+
+    /*
+     * Sicurezza:
+     * un pending viene sincronizzato SOLO
+     * con lo stesso server e lo stesso utente
+     * che hanno creato il download.
+     *
+     * I download legacy privi di "user"
+     * restano pending e non vengono spediti
+     * sull'account sbagliato.
+     */
+    BOOL sameServer =
+        [server isKindOfClass:
+            [NSString class]] &&
+        server.length &&
+        [server isEqualToString:NFServer];
+
+    BOOL legacyUser =
+        ![user isKindOfClass:
+            [NSString class]] ||
+        !user.length;
+
+    BOOL sameUser =
+        legacyUser
+            ? sameServer
+            : [user isEqualToString:NFUser];
+
+    /*
+     * Migrazione download creati prima che NineFin
+     * salvasse l'utente Jellyfin nei metadata.
+     *
+     * La adottiamo solo se il server coincide
+     * con quello attualmente autenticato.
+     */
+    if (legacyUser &&
+        sameServer &&
+        NFUser.length) {
+
+        NSMutableDictionary *m =
+            [meta mutableCopy];
+
+        m[@"user"] = NFUser;
+
+        [[NSUserDefaults standardUserDefaults]
+            setObject:m
+            forKey:key];
+
+        [[NSUserDefaults standardUserDefaults]
+            synchronize];
+
+        NSLog(
+            @"NineFin offline sync %@: "
+             @"legacy metadata adopted for user %@",
+            itemId,
+            NFUser);
+
+        user = NFUser;
+    }
+
+    if (!itemId.length ||
+        !sameServer ||
+        !sameUser) {
+
+        NSLog(
+            @"NineFin offline sync skipped: "
+             @"identity mismatch for %@",
+            itemId ?: @"<no item>");
+
+        if (completion)
+            completion(NO, NO);
+
+        return;
+    }
+
+
+    long long localTicks =
+        [meta[@"offlinePositionTicks"]
+            longLongValue];
+
+    BOOL localPlayed =
+        [meta[@"offlinePlayed"]
+            boolValue];
+
+
+    /*
+     * Prima leggiamo lo stato corrente
+     * dell'item dal server.
+     */
+    NSString *itemPath =
+        [NSString stringWithFormat:
+            @"/Users/%@/Items/%@",
+            NFUser,
+            itemId];
+
+    NFRequest(
+        itemPath,
+        @"GET",
+        nil,
+        ^(id result, NSError *error) {
+
+        if (error ||
+            ![result isKindOfClass:
+                [NSDictionary class]]) {
+
+            NSLog(
+                @"NineFin offline sync GET failed "
+                 @"for %@: %@",
+                itemId,
+                error);
+
+            if (completion)
+                completion(NO, NO);
+
+            return;
+        }
+
+
+        NSDictionary *userData = nil;
+
+        id rawUserData =
+            result[@"UserData"];
+
+        if ([rawUserData isKindOfClass:
+                [NSDictionary class]]) {
+
+            userData =
+                (NSDictionary *)rawUserData;
+
+        } else {
+
+            userData = @{};
+        }
+
+
+        BOOL serverPlayed =
+            [userData[@"Played"]
+                boolValue];
+
+        long long serverTicks =
+            [userData[@"PlaybackPositionTicks"]
+                longLongValue];
+
+
+        NSLog(
+            @"NineFin offline sync %@: "
+             @"local=%lld server=%lld "
+             @"localPlayed=%d serverPlayed=%d",
+            itemId,
+            localTicks,
+            serverTicks,
+            localPlayed,
+            serverPlayed);
+
+
+        /*
+         * Server già completato:
+         * il pending non serve più.
+         */
+        if (serverPlayed) {
+
+            NFClearOfflinePending(key);
+
+            if (completion)
+                completion(NO, YES);
+
+            return;
+        }
+
+
+        /*
+         * Fine naturale avvenuta offline.
+         */
+        if (localPlayed) {
+
+            NSString *playedPath =
+                [NSString stringWithFormat:
+                    @"/UserPlayedItems/%@",
+                    itemId];
+
+            NFRequest(
+                playedPath,
+                @"POST",
+                nil,
+                ^(id playedResult,
+                  NSError *playedError) {
+
+                (void)playedResult;
+
+                if (!playedError) {
+
+                    NSLog(
+                        @"NineFin offline sync %@: "
+                         @"marked played",
+                        itemId);
+
+                    NFClearOfflinePending(key);
+
+                    if (completion)
+                        completion(YES, NO);
+
+                    return;
+                }
+
+
+                /*
+                 * Stesso fallback legacy
+                 * già usato dal player NineFin.
+                 */
+                if (playedError.code == 404) {
+
+                    NSString *legacyPath =
+                        [NSString stringWithFormat:
+                            @"/Users/%@/PlayedItems/%@",
+                            NFUser,
+                            itemId];
+
+                    NFRequest(
+                        legacyPath,
+                        @"POST",
+                        nil,
+                        ^(id legacyResult,
+                          NSError *legacyError) {
+
+                        (void)legacyResult;
+
+                        if (!legacyError) {
+
+                            NSLog(
+                                @"NineFin offline sync %@: "
+                                 @"marked played legacy",
+                                itemId);
+
+                            NFClearOfflinePending(key);
+
+                            if (completion)
+                                completion(YES, NO);
+
+                        } else {
+
+                            NSLog(
+                                @"NineFin offline sync "
+                                 @"legacy MarkPlayed "
+                                 @"failed for %@: %@",
+                                itemId,
+                                legacyError);
+
+                            if (completion)
+                                completion(NO, NO);
+                        }
+                    });
+
+                    return;
+                }
+
+
+                NSLog(
+                    @"NineFin offline sync "
+                     @"MarkPlayed failed for %@: %@",
+                    itemId,
+                    playedError);
+
+                if (completion)
+                    completion(NO, NO);
+            });
+
+            return;
+        }
+
+
+        /*
+         * Nessun progresso valido da spedire.
+         */
+        if (localTicks <= 0) {
+
+            NFClearOfflinePending(key);
+
+            if (completion)
+                completion(NO, YES);
+
+            return;
+        }
+
+
+        /*
+         * Regola fondamentale:
+         * MAI riportare Jellyfin indietro.
+         */
+        if (serverTicks >= localTicks) {
+
+            NSLog(
+                @"NineFin offline sync %@: "
+                 @"server already ahead",
+                itemId);
+
+            NFClearOfflinePending(key);
+
+            if (completion)
+                completion(NO, YES);
+
+            return;
+        }
+
+
+        /*
+         * Il progresso offline è più avanti.
+         *
+         * Usiamo lo stesso endpoint Stopped
+         * già utilizzato dal player normale.
+         */
+        NSDictionary *body = @{
+            @"ItemId": itemId,
+            @"PositionTicks": @(localTicks),
+            @"Failed": @NO
+        };
+
+        NFRequest(
+            @"/Sessions/Playing/Stopped",
+            @"POST",
+            body,
+            ^(id stopResult,
+              NSError *stopError) {
+
+            (void)stopResult;
+
+            if (stopError) {
+
+                NSLog(
+                    @"NineFin offline sync "
+                     @"Stopped failed for %@: %@",
+                    itemId,
+                    stopError);
+
+                if (completion)
+                    completion(NO, NO);
+
+                return;
+            }
+
+
+            NSLog(
+                @"NineFin offline sync %@: "
+                 @"position uploaded",
+                itemId);
+
+            NFClearOfflinePending(key);
+
+            if (completion)
+                completion(YES, NO);
+        });
+    });
+}
+
+
+
+static BOOL NFOfflineSyncRunning = NO;
+
+
+static void NFOfflineSyncNext(
+    NSArray *entries,
+    NSUInteger index,
+    NSInteger synced,
+    NSInteger resolved,
+    NSInteger pending,
+    void (^completion)(
+        NSInteger synced,
+        NSInteger resolved,
+        NSInteger pending));
+
+
+static void NFOfflineSyncNext(
+    NSArray *entries,
+    NSUInteger index,
+    NSInteger synced,
+    NSInteger resolved,
+    NSInteger pending,
+    void (^completion)(
+        NSInteger synced,
+        NSInteger resolved,
+        NSInteger pending)) {
+
+    if (index >= entries.count) {
+
+        NFOfflineSyncRunning = NO;
+
+        NSLog(
+            @"NineFin offline sync complete: "
+             @"%ld synced, %ld resolved, %ld pending",
+            (long)synced,
+            (long)resolved,
+            (long)pending);
+
+        if (completion) {
+            completion(
+                synced,
+                resolved,
+                pending);
+        }
+
+        return;
+    }
+
+
+    NSDictionary *entry =
+        entries[index];
+
+
+    NFOfflineSyncOne(
+        entry,
+        ^(BOOL didSync,
+          BOOL didResolve) {
+
+            NSInteger nextSynced =
+                synced +
+                (didSync ? 1 : 0);
+
+            NSInteger nextResolved =
+                resolved +
+                (didResolve ? 1 : 0);
+
+            /*
+             * Se nessuna delle due condizioni
+             * è vera, il record resta pending:
+             * errore di rete, server/account
+             * non corrispondente, ecc.
+             */
+            NSInteger nextPending =
+                pending +
+                ((!didSync &&
+                  !didResolve)
+                    ? 1
+                    : 0);
+
+            NFOfflineSyncNext(
+                entries,
+                index + 1,
+                nextSynced,
+                nextResolved,
+                nextPending,
+                completion);
+        });
+}
+
+
+static void __attribute__((unused))
+NFRunOfflineSyncQueue(
+    void (^completion)(
+        NSInteger synced,
+        NSInteger resolved,
+        NSInteger pending)) {
+
+    if (NFOfflineSyncRunning) {
+
+        NSLog(
+            @"NineFin offline sync: "
+             @"already running");
+
+        return;
+    }
+
+
+    if (!NFServer.length ||
+        !NFToken.length ||
+        !NFUser.length) {
+
+        NSLog(
+            @"NineFin offline sync: "
+             @"no active authenticated session");
+
+        return;
+    }
+
+
+    NSArray *entries =
+        NFPendingOfflineSyncEntries();
+
+    if (!entries.count) {
+
+        NSLog(
+            @"NineFin offline sync: "
+             @"nothing pending");
+
+        if (completion) {
+            completion(0, 0, 0);
+        }
+
+        return;
+    }
+
+
+    NFOfflineSyncRunning = YES;
+
+    NSLog(
+        @"NineFin offline sync starting: "
+         @"%lu pending",
+        (unsigned long)entries.count);
+
+
+    NFOfflineSyncNext(
+        entries,
+        0,
+        0,
+        0,
+        0,
+        completion);
+}
+
+
+
+static void NFShowOfflineSyncToast(
+    UIViewController *vc,
+    NSInteger synced) {
+
+    if (!vc || synced <= 0)
+        return;
+
+    dispatch_async(
+        dispatch_get_main_queue(), ^{
+
+        if (!vc.view.window)
+            return;
+
+        UIView *old =
+            [vc.view viewWithTag:9072];
+
+        [old removeFromSuperview];
+
+        CGFloat width =
+            MIN(CGRectGetWidth(vc.view.bounds) - 32.0,
+                430.0);
+
+        UILabel *toast =
+            [[UILabel alloc]
+                initWithFrame:CGRectMake(
+                    (CGRectGetWidth(vc.view.bounds) -
+                        width) / 2.0,
+                    14.0,
+                    width,
+                    44.0)];
+
+        toast.tag = 9072;
+
+        toast.text =
+            synced == 1
+                ? @"✓ Offline sincronizzato · 1 progresso aggiornato"
+                : [NSString stringWithFormat:
+                    @"✓ Offline sincronizzato · %ld progressi aggiornati",
+                    (long)synced];
+
+        toast.textAlignment =
+            NSTextAlignmentCenter;
+
+        toast.textColor =
+            [UIColor whiteColor];
+
+        toast.font =
+            [UIFont boldSystemFontOfSize:13.0];
+
+        toast.backgroundColor =
+            [UIColor colorWithWhite:0.08
+                              alpha:0.94];
+
+        toast.layer.cornerRadius = 9.0;
+        toast.clipsToBounds = YES;
+        toast.alpha = 0.0;
+
+        [vc.view addSubview:toast];
+
+        [UIView animateWithDuration:0.20
+            animations:^{
+                toast.alpha = 1.0;
+            }];
+
+        dispatch_after(
+            dispatch_time(
+                DISPATCH_TIME_NOW,
+                (int64_t)(2.4 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{
+
+            [UIView animateWithDuration:0.25
+                animations:^{
+                    toast.alpha = 0.0;
+                }
+                completion:^(BOOL finished) {
+                    (void)finished;
+                    [toast removeFromSuperview];
+                }];
+        });
+    });
+}
+
+
 static void NFAlert(UIViewController *vc,
                     NSString *title, NSString *message) {
     UIAlertController *a = [UIAlertController
@@ -443,6 +1204,7 @@ static void NFAlert(UIViewController *vc,
 @property (assign, nonatomic) BOOL didStart;
 @property (assign, nonatomic) BOOL didStop;
 @property (assign, nonatomic) BOOL observingPlaybackEnd;
+@property (copy, nonatomic) NSString *playMethod;
 
 - (void)stopResumeObservation;
 - (void)stopPlaybackEndObservation;
@@ -535,6 +1297,10 @@ static void NFAlert(UIViewController *vc,
 @property (strong, nonatomic) NSArray *nfStreams;
 @property (strong, nonatomic) NSNumber *nfAudio;
 @property (strong, nonatomic) NSNumber *nfSubtitle;
+@property (copy, nonatomic) NSString *nfDownloadExtension;
+@property (assign, nonatomic) NSInteger nfDownloadPercent;
+@property (strong, nonatomic) UIButton *nfDownloadButton;
+@property (strong, nonatomic) UIProgressView *nfDownloadProgressView;
 
 - (instancetype)initWithItem:(NSDictionary *)item
                        owner:(NFLibraryController *)owner;
@@ -1119,6 +1885,8 @@ static void NFAlert(UIViewController *vc,
         NFTrackedPlayerController *playerVC =
             [[NFTrackedPlayerController alloc] init];
 
+        playerVC.playMethod = @"Transcode";
+
         // Il seek avverrà su AVPlayer, non sull'URL HLS.
         NSDictionary *userData =
             [item[@"UserData"] isKindOfClass:[NSDictionary class]]
@@ -1190,7 +1958,11 @@ static void *NFResumeContext = &NFResumeContext;
     if ([endpoint hasSuffix:@"/Stopped"]) {
         body[@"Failed"] = @NO;
     } else {
-        body[@"PlayMethod"] = @"Transcode";
+        body[@"PlayMethod"] =
+            self.playMethod.length
+                ? self.playMethod
+                : @"Transcode";
+
         body[@"CanSeek"] = @YES;
         body[@"IsPaused"] = @(self.player.rate == 0);
         body[@"IsMuted"] = @NO;
@@ -1212,6 +1984,10 @@ static void *NFResumeContext = &NFResumeContext;
     [self report:endpoint completion:nil];
 }
 
+
+/*
+ * Fine naturale della riproduzione.
+ */
 - (void)markItemPlayed {
     NSString *itemId = [self.itemId copy];
     NSString *user = [NFUser copy];
@@ -1231,6 +2007,9 @@ static void *NFResumeContext = &NFResumeContext;
             return;
         }
 
+        /*
+         * Fallback legacy per server più vecchi.
+         */
         if (error.code == 404 && user.length) {
             NSString *legacy = [NSString stringWithFormat:
                 @"/Users/%@/PlayedItems/%@", user, itemId];
@@ -1255,6 +2034,7 @@ static void *NFResumeContext = &NFResumeContext;
     });
 }
 
+
 - (void)stopPlaybackEndObservation {
     if (!self.observingPlaybackEnd)
         return;
@@ -1267,6 +2047,7 @@ static void *NFResumeContext = &NFResumeContext;
     self.observingPlaybackEnd = NO;
 }
 
+
 - (void)playbackDidEnd:(NSNotification *)notification {
     if (self.didStop)
         return;
@@ -1276,6 +2057,10 @@ static void *NFResumeContext = &NFResumeContext;
 
     NSLog(@"NineFin: playback reached natural end");
 
+    /*
+     * Impedisce a viewWillDisappear di inviare
+     * un secondo Stopped.
+     */
     self.didStop = YES;
 
     [self stopResumeObservation];
@@ -1286,11 +2071,15 @@ static void *NFResumeContext = &NFResumeContext;
         self.progressObserver = nil;
     }
 
+    /*
+     * Prima Stopped, poi MarkPlayed.
+     */
     [self report:@"/Sessions/Playing/Stopped"
         completion:^{
             [self markItemPlayed];
         }];
 }
+
 
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
@@ -1483,6 +2272,167 @@ static void NFPoster(NSString *itemId, UIImageView *view) {
 }
 
 
+static NSString *NFDownloadMetadataKey(
+    NSString *filename) {
+
+    return [@"NineFin.DownloadMeta."
+        stringByAppendingString:
+            filename ?: @""];
+}
+
+
+static NSURL *NFDownloadArtworkURL(
+    NSString *filename) {
+
+    NSURL *documents =
+        [[[NSFileManager defaultManager]
+            URLsForDirectory:NSDocumentDirectory
+            inDomains:NSUserDomainMask] firstObject];
+
+    NSURL *directory =
+        [documents URLByAppendingPathComponent:
+            @"NineFinDownloadArtwork"
+            isDirectory:YES];
+
+    [[NSFileManager defaultManager]
+        createDirectoryAtURL:directory
+        withIntermediateDirectories:YES
+        attributes:nil
+        error:NULL];
+
+    NSString *base =
+        [filename stringByDeletingPathExtension];
+
+    return [directory URLByAppendingPathComponent:
+        [base stringByAppendingPathExtension:@"jpg"]];
+}
+
+
+static void NFSaveDownloadMetadata(
+    NSDictionary *item,
+    NSString *storageKey,
+    NSString *extension) {
+
+    if (!storageKey.length)
+        return;
+
+    NSString *filename =
+        [NSString stringWithFormat:
+            @"%@.%@",
+            storageKey,
+            extension.length ? extension : @"media"];
+
+    NSMutableDictionary *meta =
+        [NSMutableDictionary dictionary];
+
+    NSString *title = item[@"Name"];
+    NSString *type = item[@"Type"];
+    NSString *series = item[@"SeriesName"];
+
+    if ([title isKindOfClass:[NSString class]])
+        meta[@"title"] = title;
+
+    if ([type isKindOfClass:[NSString class]])
+        meta[@"type"] = type;
+
+    if ([series isKindOfClass:[NSString class]])
+        meta[@"series"] = series;
+
+    if (item[@"ParentIndexNumber"])
+        meta[@"season"] = item[@"ParentIndexNumber"];
+
+    if (item[@"IndexNumber"])
+        meta[@"episode"] = item[@"IndexNumber"];
+
+    if (item[@"RunTimeTicks"])
+        meta[@"runtimeTicks"] = item[@"RunTimeTicks"];
+
+    if (item[@"Id"])
+        meta[@"itemId"] = item[@"Id"];
+
+    if (NFServer.length)
+        meta[@"server"] = NFServer;
+
+    if (NFUser.length)
+        meta[@"user"] = NFUser;
+
+    [[NSUserDefaults standardUserDefaults]
+        setObject:meta
+        forKey:NFDownloadMetadataKey(filename)];
+
+    [[NSUserDefaults standardUserDefaults]
+        synchronize];
+}
+
+
+static void NFCacheDownloadArtwork(
+    NSString *itemId,
+    NSString *storageKey,
+    NSString *extension) {
+
+    if (!itemId.length || !storageKey.length)
+        return;
+
+    NSString *filename =
+        [NSString stringWithFormat:
+            @"%@.%@",
+            storageKey,
+            extension.length ? extension : @"media"];
+
+    NSString *path =
+        [NSString stringWithFormat:
+            @"/Items/%@/Images/Primary?"
+             "maxHeight=260&quality=75",
+            itemId];
+
+    NSMutableURLRequest *request =
+        [NSMutableURLRequest
+            requestWithURL:NFURL(path)];
+
+    request.timeoutInterval = 15;
+
+    NFHeaders(request);
+
+    [[[NSURLSession sharedSession]
+        dataTaskWithRequest:request
+        completionHandler:^(
+            NSData *data,
+            NSURLResponse *response,
+            NSError *error) {
+
+            if (error || !data.length)
+                return;
+
+            NSHTTPURLResponse *http =
+                (NSHTTPURLResponse *)response;
+
+            if (http.statusCode != 200)
+                return;
+
+            UIImage *image =
+                [UIImage imageWithData:data];
+
+            if (!image)
+                return;
+
+            NSData *jpeg =
+                UIImageJPEGRepresentation(
+                    image, 0.78);
+
+            if (!jpeg.length)
+                return;
+
+            NSURL *destination =
+                NFDownloadArtworkURL(filename);
+
+            [jpeg writeToURL:destination
+                options:NSDataWritingAtomic
+                error:NULL];
+        }] resume];
+}
+
+
+
 @interface NFHomeController : NFLibraryController
 @property (strong, nonatomic) NSArray *resumeItems;
 @property (strong, nonatomic) NSArray *nextItems;
@@ -1537,6 +2487,34 @@ static void NFPoster(NSString *itemId, UIImageView *view) {
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
 
+    /*
+     * Prova a riconciliare eventuali
+     * progressi registrati offline.
+     */
+    __weak NFHomeController *weakSelf = self;
+
+    NFRunOfflineSyncQueue(
+        ^(NSInteger synced,
+          NSInteger resolved,
+          NSInteger pending) {
+
+        (void)resolved;
+        (void)pending;
+
+        if (synced <= 0)
+            return;
+
+        NFHomeController *vc =
+            weakSelf;
+
+        if (!vc)
+            return;
+
+        NFShowOfflineSyncToast(
+            vc,
+            synced);
+    });
+
     if (!self.refreshTimer) {
         self.refreshTimer =
             [NSTimer scheduledTimerWithTimeInterval:60.0
@@ -1571,6 +2549,30 @@ static void NFPoster(NSString *itemId, UIImageView *view) {
 
     if (self.presentedViewController)
         return;
+
+    __weak NFHomeController *weakSelf = self;
+
+    NFRunOfflineSyncQueue(
+        ^(NSInteger synced,
+          NSInteger resolved,
+          NSInteger pending) {
+
+        (void)resolved;
+        (void)pending;
+
+        if (synced <= 0)
+            return;
+
+        NFHomeController *vc =
+            weakSelf;
+
+        if (!vc)
+            return;
+
+        NFShowOfflineSyncToast(
+            vc,
+            synced);
+    });
 
     [self reloadItems];
 }
@@ -1734,6 +2736,10 @@ static void NFPoster(NSString *itemId, UIImageView *view) {
                     ? [positionValue longLongValue]
                     : 0;
 
+            /*
+             * Item già visto e senza posizione:
+             * non deve apparire in Continua a guardare.
+             */
             if (played && position <= 0) {
                 NSLog(
                     @"NineFin Resume: filtered zombie item %@",
@@ -2556,7 +3562,7 @@ static void NFPoster(NSString *itemId, UIImageView *view) {
 
 - (NSInteger)tableView:(UITableView *)table
  numberOfRowsInSection:(NSInteger)section {
-    return 9;
+    return 10;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)table
@@ -2565,6 +3571,7 @@ static void NFPoster(NSString *itemId, UIImageView *view) {
         @"Home",
         @"Ricerca",
         @"Preferiti",
+        @"Scaricati",
         @"Personalizza home",
         @"Server e predefinito",
         @"Aggiungi server",
@@ -2593,14 +3600,29 @@ static void NFPoster(NSString *itemId, UIImageView *view) {
  didSelectRowAtIndexPath:(NSIndexPath *)index {
 
     NSInteger newSelection = index.row;
-    NSInteger selection = newSelection > 2
-        ? newSelection - 2 : newSelection;
+
+    NSInteger selection =
+        newSelection > 3
+            ? newSelection - 3
+            : newSelection;
 
     UIViewController *host = self.host;
 
     [self dismissViewControllerAnimated:YES completion:^{
 
         if (selection == 0) return;
+
+        if (newSelection == 3) {
+            NFDownloadsController *downloads =
+                [[NFDownloadsController alloc]
+                    initWithStyle:UITableViewStylePlain];
+
+            [host.navigationController
+                pushViewController:downloads
+                animated:YES];
+
+            return;
+        }
 
         if (newSelection == 1 || newSelection == 2) {
             NFDiscoveryController *discovery =
@@ -2821,6 +3843,19 @@ static void NFPoster(NSString *itemId, UIImageView *view) {
             self.nfSubtitle = nil;
         }
 
+        NSString *container = source[@"Container"];
+
+        if ([container isKindOfClass:[NSString class]] &&
+            container.length) {
+
+            NSString *first =
+                [[container componentsSeparatedByString:@","]
+                    firstObject];
+
+            self.nfDownloadExtension =
+                first.lowercaseString;
+        }
+
         self.nfSourceId = sid;
         self.nfStreams = streams;
         [self renderHeader];
@@ -3023,7 +4058,116 @@ static void NFPoster(NSString *itemId, UIImageView *view) {
     });
 }
 
+
+- (BOOL)nfCanDownloadOriginal {
+    NSString *type = self.item[@"Type"];
+
+    if (![type isKindOfClass:[NSString class]])
+        return NO;
+
+    return [type isEqualToString:@"Movie"] ||
+           [type isEqualToString:@"Episode"] ||
+           [type isEqualToString:@"Video"];
+}
+
+
+- (NSString *)nfOriginalExtension {
+    NSString *container = self.nfDownloadExtension;
+
+    if (![container isKindOfClass:[NSString class]] ||
+        !container.length) {
+
+        container = self.item[@"Container"];
+    }
+
+    if (![container isKindOfClass:[NSString class]] ||
+        !container.length) {
+
+        return @"media";
+    }
+
+    NSString *first =
+        [[container componentsSeparatedByString:@","]
+            firstObject];
+
+    first = [first
+        stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+    return first.length
+        ? first.lowercaseString
+        : @"media";
+}
+
+
+/*
+ * Namespace locale per evitare collisioni fra due server Jellyfin.
+ *
+ * Non è un identificatore inviato al server: serve esclusivamente
+ * come nome interno del download nel sandbox NineFin.
+ */
+- (NSString *)nfDownloadStorageKey {
+    NSString *itemId = self.item[@"Id"];
+
+    if (![itemId isKindOfClass:[NSString class]] ||
+        !itemId.length)
+        return @"";
+
+    NSString *server =
+        NFServer.length ? NFServer : @"server";
+
+    NSString *raw =
+        [NSString stringWithFormat:
+            @"%@__%@", server, itemId];
+
+    NSMutableString *safe =
+        [NSMutableString string];
+
+    NSCharacterSet *allowed =
+        [NSCharacterSet alphanumericCharacterSet];
+
+    BOOL previousUnderscore = NO;
+
+    for (NSUInteger i = 0; i < raw.length; i++) {
+        unichar c = [raw characterAtIndex:i];
+
+        if ([allowed characterIsMember:c]) {
+            [safe appendFormat:@"%C", c];
+            previousUnderscore = NO;
+        } else if (!previousUnderscore) {
+            [safe appendString:@"_"];
+            previousUnderscore = YES;
+        }
+    }
+
+    while ([safe hasSuffix:@"_"] && safe.length)
+        [safe deleteCharactersInRange:
+            NSMakeRange(safe.length - 1, 1)];
+
+    /*
+     * Manteniamo il filename ben sotto ai limiti del filesystem.
+     * Conserviamo sia l'inizio (server) sia la fine (ItemId).
+     */
+    if (safe.length > 180) {
+        NSString *head =
+            [safe substringToIndex:95];
+
+        NSString *tail =
+            [safe substringFromIndex:
+                safe.length - 80];
+
+        safe = [[NSString stringWithFormat:
+            @"%@_%@", head, tail] mutableCopy];
+    }
+
+    return safe;
+}
+
+
 - (void)renderHeader {
+    self.nfDownloadButton = nil;
+    self.nfDownloadProgressView = nil;
+
     CGFloat width = self.tableView.bounds.size.width;
     if (width < 200)
         width = [UIScreen mainScreen].bounds.size.width;
@@ -3152,8 +4296,34 @@ static void NFPoster(NSString *itemId, UIImageView *view) {
             [self.item[@"UserData"][@"PlaybackPositionTicks"]
                 doubleValue];
 
-        NSString *label =
-            position > 0 ? @"▶  Riprendi" : @"▶  Riproduci";
+        BOOL offlineAvailable = NO;
+
+        if ([self nfCanDownloadOriginal]) {
+            NSString *storageKey =
+                [self nfDownloadStorageKey];
+
+            NSString *extension =
+                [self nfOriginalExtension];
+
+            if (storageKey.length) {
+                offlineAvailable =
+                    [[NFDownloadManager sharedManager]
+                        isDownloadedItemId:storageKey
+                        fileExtension:extension];
+            }
+        }
+
+        NSString *label = nil;
+
+        if (offlineAvailable) {
+            label = position > 0
+                ? @"▶  Riprendi offline"
+                : @"▶  Riproduci offline";
+        } else {
+            label = position > 0
+                ? @"▶  Riprendi"
+                : @"▶  Riproduci";
+        }
 
         [play setTitle:label forState:UIControlStateNormal];
 
@@ -3203,6 +4373,137 @@ static void NFPoster(NSString *itemId, UIImageView *view) {
             [header addSubview:b];
             bottom += 47;
         }
+
+        if ([self nfCanDownloadOriginal]) {
+            NSString *storageKey =
+                [self nfDownloadStorageKey];
+
+            NSString *extension =
+                [self nfOriginalExtension];
+
+            NFDownloadManager *downloads =
+                [NFDownloadManager sharedManager];
+
+            BOOL downloading =
+                [downloads
+                    isDownloadingItemId:storageKey];
+
+            BOOL downloaded =
+                [downloads
+                    isDownloadedItemId:storageKey
+                    fileExtension:extension];
+
+            double liveProgress =
+                downloading
+                    ? [downloads
+                        progressForItemId:storageKey]
+                    : 0.0;
+
+            if (!isfinite(liveProgress) ||
+                liveProgress < 0.0)
+                liveProgress = 0.0;
+
+            if (liveProgress > 1.0)
+                liveProgress = 1.0;
+
+            if (downloading) {
+                self.nfDownloadPercent =
+                    (NSInteger)(liveProgress * 100.0);
+            }
+
+            CGFloat downloadHeight =
+                downloading ? 60.0 : 42.0;
+
+            UIButton *download =
+                [UIButton buttonWithType:
+                    UIButtonTypeSystem];
+
+            download.frame =
+                CGRectMake(
+                    16,
+                    bottom,
+                    width - 32,
+                    downloadHeight);
+
+            download.backgroundColor = NFPanel();
+            download.layer.cornerRadius = 7;
+
+            download.titleLabel.font =
+                [UIFont systemFontOfSize:14];
+
+            NSString *downloadTitle = nil;
+
+            if (downloading) {
+                downloadTitle =
+                    [NSString stringWithFormat:
+                        @"↓ Download in corso · %ld%% · Annulla",
+                        (long)self.nfDownloadPercent];
+
+                download.contentEdgeInsets =
+                    UIEdgeInsetsMake(
+                        0, 0, 14, 0);
+
+            } else if (downloaded) {
+                downloadTitle =
+                    @"✓ Scaricato · Tocca per eliminare";
+
+            } else {
+                downloadTitle =
+                    @"↓ Scarica originale";
+            }
+
+            [download setTitle:downloadTitle
+                forState:UIControlStateNormal];
+
+            [download setTitleColor:NFAccent()
+                forState:UIControlStateNormal];
+
+            [download addTarget:self
+                action:@selector(nfDownloadPressed)
+                forControlEvents:
+                    UIControlEventTouchUpInside];
+
+            [header addSubview:download];
+
+            self.nfDownloadButton = download;
+
+            if (downloading) {
+                UIProgressView *progress =
+                    [[UIProgressView alloc]
+                        initWithProgressViewStyle:
+                            UIProgressViewStyleDefault];
+
+                progress.frame =
+                    CGRectMake(
+                        12,
+                        downloadHeight - 13,
+                        download.bounds.size.width - 24,
+                        4);
+
+                progress.autoresizingMask =
+                    UIViewAutoresizingFlexibleWidth |
+                    UIViewAutoresizingFlexibleTopMargin;
+
+                progress.progressTintColor =
+                    NFAccent();
+
+                progress.trackTintColor =
+                    [UIColor colorWithWhite:
+                        1.0 alpha:0.12];
+
+                progress.progress =
+                    (float)liveProgress;
+
+                progress.userInteractionEnabled = NO;
+
+                [download addSubview:progress];
+
+                self.nfDownloadProgressView =
+                    progress;
+            }
+
+            bottom += downloading ? 70 : 55;
+        }
     }
 
     UIButton *favorite =
@@ -3238,6 +4539,304 @@ static void NFPoster(NSString *itemId, UIImageView *view) {
 
     header.frame = CGRectMake(0, 0, width, bottom);
     self.tableView.tableHeaderView = header;
+}
+
+
+- (void)nfDownloadPressed {
+    NSString *itemId = self.item[@"Id"];
+
+    if (![itemId isKindOfClass:[NSString class]] ||
+        !itemId.length)
+        return;
+
+    NSString *storageKey =
+        [self nfDownloadStorageKey];
+
+    NSString *extension =
+        [self nfOriginalExtension];
+
+    if (!storageKey.length)
+        return;
+
+    NFDownloadManager *downloads =
+        [NFDownloadManager sharedManager];
+
+
+    /*
+     * TAP DURANTE IL DOWNLOAD = CANCEL
+     */
+    if ([downloads isDownloadingItemId:storageKey]) {
+        [downloads cancelDownloadForItemId:storageKey];
+
+        self.nfDownloadPercent = 0;
+        [self renderHeader];
+        return;
+    }
+
+
+    /*
+     * TAP SU FILE GIA' PRESENTE = DELETE
+     */
+    if ([downloads
+            isDownloadedItemId:storageKey
+            fileExtension:extension]) {
+
+        UIAlertController *alert =
+            [UIAlertController
+                alertControllerWithTitle:
+                    @"Elimina download"
+                message:
+                    @"Vuoi eliminare la copia offline di questo contenuto?"
+                preferredStyle:
+                    UIAlertControllerStyleAlert];
+
+        [alert addAction:
+            [UIAlertAction
+                actionWithTitle:@"Annulla"
+                style:UIAlertActionStyleCancel
+                handler:nil]];
+
+        __weak NFDetailsController *weakSelf =
+            self;
+
+        [alert addAction:
+            [UIAlertAction
+                actionWithTitle:@"Elimina"
+                style:UIAlertActionStyleDestructive
+                handler:^(UIAlertAction *action) {
+
+                    NFDetailsController *vc =
+                        weakSelf;
+
+                    if (!vc)
+                        return;
+
+                    NSError *error = nil;
+
+                    BOOL removed =
+                        [[NFDownloadManager sharedManager]
+                            removeDownloadedItemId:
+                                storageKey
+                            fileExtension:
+                                extension
+                            error:&error];
+
+                    if (!removed) {
+                        NFAlert(vc,
+                            @"Errore eliminazione",
+                            error.localizedDescription ?:
+                                @"Impossibile eliminare il file.");
+                        return;
+                    }
+
+                    vc.nfDownloadPercent = 0;
+                    [vc renderHeader];
+                }]];
+
+        [self presentViewController:alert
+            animated:YES
+            completion:nil];
+
+        return;
+    }
+
+
+    /*
+     * NUOVO DOWNLOAD
+     *
+     * Endpoint ufficiale Jellyfin:
+     * GET /Items/{itemId}/Download
+     *
+     * Autenticazione tramite lo stesso Authorization header
+     * usato dal resto di NineFin.
+     */
+    NFSaveDownloadMetadata(
+        self.item,
+        storageKey,
+        extension);
+
+    NFCacheDownloadArtwork(
+        itemId,
+        storageKey,
+        extension);
+
+    NSString *path =
+        [NSString stringWithFormat:
+            @"/Items/%@/Download",
+            itemId];
+
+    NSURL *url = NFURL(path);
+
+    if (!url) {
+        NFAlert(self,
+            @"Download",
+            @"URL Jellyfin non valida.");
+        return;
+    }
+
+    NSMutableURLRequest *request =
+        [NSMutableURLRequest
+            requestWithURL:url];
+
+    request.HTTPMethod = @"GET";
+    request.timeoutInterval = 60.0;
+
+    NFHeaders(request);
+
+    /*
+     * NFHeaders usa application/json per le API normali.
+     * Qui aspettiamo invece un media binario.
+     */
+    [request setValue:
+        @"video/*,audio/*,application/octet-stream,*/*"
+        forHTTPHeaderField:@"Accept"];
+
+    NSString *server = [NFServer copy];
+
+    self.nfDownloadPercent = 0;
+
+    __weak NFDetailsController *weakSelf =
+        self;
+
+    NSURLSessionDownloadTask *task =
+        [downloads
+            startDownloadWithRequest:request
+            itemId:storageKey
+            fileExtension:extension
+            progress:^(
+                int64_t bytesWritten,
+                int64_t totalBytesWritten,
+                int64_t totalBytesExpectedToWrite) {
+
+                NFDetailsController *vc =
+                    weakSelf;
+
+                if (!vc)
+                    return;
+
+                if (![NFServer
+                        isEqualToString:server])
+                    return;
+
+                if (![vc.item[@"Id"]
+                        isEqualToString:itemId])
+                    return;
+
+                if (totalBytesExpectedToWrite <= 0) {
+                    [vc.nfDownloadButton
+                        setTitle:
+                            @"↓ Download in corso · Annulla"
+                        forState:UIControlStateNormal];
+
+                    return;
+                }
+
+                double fraction =
+                    (double)totalBytesWritten /
+                    (double)totalBytesExpectedToWrite;
+
+                if (!isfinite(fraction) ||
+                    fraction < 0.0)
+                    fraction = 0.0;
+
+                if (fraction > 1.0)
+                    fraction = 1.0;
+
+                /*
+                 * Barra realmente live:
+                 * segue ogni callback NSURLSession.
+                 *
+                 * animated:NO evita di accumulare
+                 * centinaia di animazioni su hardware A5.
+                 */
+                vc.nfDownloadProgressView.progress =
+                    (float)fraction;
+
+                NSInteger percent =
+                    (NSInteger)(fraction * 100.0);
+
+                if (percent > 100)
+                    percent = 100;
+
+                /*
+                 * Il testo cambia solo al cambio
+                 * della percentuale intera.
+                 */
+                if (percent !=
+                    vc.nfDownloadPercent) {
+
+                    vc.nfDownloadPercent =
+                        percent;
+
+                    NSString *title =
+                        [NSString stringWithFormat:
+                            @"↓ Download in corso · %ld%% · Annulla",
+                            (long)percent];
+
+                    [vc.nfDownloadButton
+                        setTitle:title
+                        forState:UIControlStateNormal];
+                }
+
+            }
+            completion:^(
+                NSURL *localURL,
+                NSError *error) {
+
+                NFDetailsController *vc =
+                    weakSelf;
+
+                if (!vc)
+                    return;
+
+                BOOL sameScreen =
+                    [NFServer isEqualToString:server] &&
+                    [vc.item[@"Id"]
+                        isEqualToString:itemId];
+
+                if (!sameScreen)
+                    return;
+
+                vc.nfDownloadPercent = 0;
+                [vc renderHeader];
+
+                if (error) {
+                    /*
+                     * La cancellazione richiesta dall'utente
+                     * non deve produrre un popup di errore.
+                     */
+                    if (error.code ==
+                        NSURLErrorCancelled)
+                        return;
+
+                    NFAlert(vc,
+                        @"Download fallito",
+                        error.localizedDescription);
+                    return;
+                }
+
+                if (localURL) {
+                    NSString *message =
+                        [NSString stringWithFormat:
+                            @"Copia offline salvata correttamente.\n\n%@",
+                            localURL.lastPathComponent];
+
+                    NFAlert(vc,
+                        @"Download completato",
+                        message);
+                }
+            }];
+
+    if (!task) {
+        [self renderHeader];
+        return;
+    }
+
+    /*
+     * Fa comparire immediatamente
+     * "Download in corso".
+     */
+    [self renderHeader];
 }
 
 
@@ -3299,8 +4898,102 @@ static void NFPoster(NSString *itemId, UIImageView *view) {
 }
 
 - (void)playPressed {
+    /*
+     * Se esiste una copia locale completa,
+     * preferiscila allo streaming.
+     */
+    if ([self nfCanDownloadOriginal]) {
+        NSString *storageKey =
+            [self nfDownloadStorageKey];
+
+        NSString *extension =
+            [self nfOriginalExtension];
+
+        NFDownloadManager *downloads =
+            [NFDownloadManager sharedManager];
+
+        if (storageKey.length &&
+            [downloads
+                isDownloadedItemId:storageKey
+                fileExtension:extension]) {
+
+            NSURL *localURL =
+                [downloads
+                    localURLForItemId:storageKey
+                    fileExtension:extension];
+
+            if ([[NSFileManager defaultManager]
+                    fileExistsAtPath:localURL.path]) {
+
+                NSLog(@"NineFin offline playback: %@",
+                    localURL.path);
+
+                NFTrackedPlayerController *playerVC =
+                    [[NFTrackedPlayerController alloc]
+                        init];
+
+                NSString *itemId =
+                    self.item[@"Id"];
+
+                playerVC.itemId =
+                    [itemId isKindOfClass:
+                        [NSString class]]
+                        ? itemId
+                        : nil;
+
+                /*
+                 * Il file proviene da questa media source,
+                 * ma non esiste una sessione di transcode
+                 * attiva lato Jellyfin.
+                 */
+                playerVC.mediaSourceId =
+                    self.nfSourceId;
+
+                playerVC.playSessionId = nil;
+                playerVC.playMethod = @"DirectPlay";
+
+                NSDictionary *userData =
+                    [self.item[@"UserData"]
+                        isKindOfClass:
+                            [NSDictionary class]]
+                        ? self.item[@"UserData"]
+                        : nil;
+
+                long long resumeTicks =
+                    [userData[@"PlaybackPositionTicks"]
+                        longLongValue];
+
+                if (resumeTicks < 0)
+                    resumeTicks = 0;
+
+                playerVC.resumeTicks =
+                    resumeTicks;
+
+                playerVC.player =
+                    [AVPlayer
+                        playerWithURL:localURL];
+
+                UIViewController *presenter =
+                    self.navigationController
+                        .topViewController ?: self;
+
+                [presenter
+                    presentViewController:playerVC
+                    animated:YES
+                    completion:nil];
+
+                return;
+            }
+        }
+    }
+
+    /*
+     * Fallback normale:
+     * PlaybackInfo -> HLS transcoding.
+     */
     if (!self.playerOwner) {
-        NFAlert(self, @"Player non disponibile",
+        NFAlert(self,
+            @"Player non disponibile",
             @"Torna alla libreria e riapri il contenuto.");
         return;
     }
@@ -3310,6 +5003,7 @@ static void NFPoster(NSString *itemId, UIImageView *view) {
         subtitle:self.nfSubtitle
         sourceId:self.nfSourceId];
 }
+
 
 - (void)loadSeasons {
     NSString *seriesId = self.item[@"Id"];
@@ -3559,10 +5253,72 @@ static void NFPoster(NSString *itemId, UIImageView *view) {
 
     NFRestore();
 
-    if (NFServer.length && NFToken.length && NFUser.length)
+    BOOL hasDownloads =
+        [NFDownloadManager sharedManager]
+            .downloadedFiles.count > 0;
+
+    if (!NFNetworkRouteAvailable() &&
+        hasDownloads) {
+
+        NSLog(@"NineFin startup: offline -> Scaricati");
+
+        NFDownloadsController *downloads =
+            [[NFDownloadsController alloc]
+                initWithStyle:
+                    UITableViewStylePlain];
+
+        __weak NFAppDelegate *weakApp = self;
+
+        downloads.onlineAvailableHandler =
+            ^BOOL{
+                return NFNetworkRouteAvailable();
+            };
+
+        downloads.syncOnlineHandler =
+            ^(void (^completion)(
+                NSInteger synced,
+                NSInteger resolved,
+                NSInteger pending)) {
+
+                NFRunOfflineSyncQueue(
+                    completion);
+            };
+
+        downloads.openOnlineHandler =
+            ^{
+                NFAppDelegate *app = weakApp;
+
+                if (!app)
+                    return;
+
+                if (NFServer.length &&
+                    NFToken.length &&
+                    NFUser.length) {
+
+                    [app showLibrary];
+
+                } else {
+                    [app showLogin];
+                }
+            };
+
+        UINavigationController *nav =
+            [[UINavigationController alloc]
+                initWithRootViewController:
+                    downloads];
+
+        self.window.rootViewController = nav;
+        [self.window makeKeyAndVisible];
+
+    } else if (NFServer.length &&
+               NFToken.length &&
+               NFUser.length) {
+
         [self showLibrary];
-    else
+
+    } else {
         [self showLogin];
+    }
 
     [self.window makeKeyAndVisible];
     return YES;
