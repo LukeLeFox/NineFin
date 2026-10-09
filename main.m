@@ -360,7 +360,7 @@ static void NFHeaders(NSMutableURLRequest *r) {
         stringWithFormat:
         @"MediaBrowser Client=\"NineFin\", "
          "Device=\"iPhone iOS9\", "
-         "DeviceId=\"%@\", Version=\"0.7.3\"",
+         "DeviceId=\"%@\", Version=\"0.7.4\"",
         NFDevice()];
 
     if (NFToken.length) {
@@ -371,6 +371,188 @@ static void NFHeaders(NSMutableURLRequest *r) {
     [r setValue:@"application/json"
         forHTTPHeaderField:@"Accept"];
 }
+
+
+#pragma mark - Persistent download authentication
+
+/*
+ * Ricostruisce una richiesta di download dopo un relaunch.
+ *
+ * Nessun token viene letto dal manifest.
+ * Il token arriva esclusivamente dal Keychain del
+ * server a cui appartiene il job.
+ *
+ * La funzione è predisposta per la futura FIFO logica.
+ */
+static NSMutableURLRequest * __attribute__((unused))
+NFRequestForPersistedDownloadJob(
+    NSDictionary *job) {
+
+    if (![job isKindOfClass:[NSDictionary class]])
+        return nil;
+
+    NSString *requestURL =
+        job[@"requestURL"];
+
+    NSString *storageKey =
+        job[@"itemId"];
+
+    if (![requestURL isKindOfClass:[NSString class]] ||
+        !requestURL.length ||
+        ![storageKey isKindOfClass:[NSString class]] ||
+        !storageKey.length) {
+
+        return nil;
+    }
+
+    NSURLComponents *components =
+        [NSURLComponents
+            componentsWithString:requestURL];
+
+    NSURL *url =
+        components.URL;
+
+    if (!url || !components.host.length)
+        return nil;
+
+    NSString *scheme =
+        components.scheme.lowercaseString;
+
+    if (!([scheme isEqualToString:@"http"] ||
+          [scheme isEqualToString:@"https"]))
+        return nil;
+
+    /*
+     * Un job di download non deve incorporare
+     * credenziali, query o fragment.
+     */
+    if (components.user.length ||
+        components.password.length ||
+        components.percentEncodedQuery.length ||
+        components.percentEncodedFragment.length) {
+
+        return nil;
+    }
+
+    /*
+     * Cerchiamo il server esatto tra quelli
+     * configurati in NineFin.
+     */
+    NSString *matchedServer = nil;
+    NSString *matchedItemId = nil;
+
+    for (NSString *savedServer in NFServerList()) {
+
+        if (![savedServer
+                isKindOfClass:[NSString class]])
+            continue;
+
+        NSString *base =
+            NFCleanServer(savedServer);
+
+        while ([base hasSuffix:@"/"]) {
+            base =
+                [base substringToIndex:
+                    base.length - 1];
+        }
+
+        NSString *prefix =
+            [base stringByAppendingString:
+                @"/Items/"];
+
+        if (![requestURL hasPrefix:prefix])
+            continue;
+
+        NSString *tail =
+            [requestURL substringFromIndex:
+                prefix.length];
+
+        NSArray *parts =
+            [tail componentsSeparatedByString:@"/"];
+
+        if (parts.count != 2 ||
+            ![parts[1] isEqualToString:@"Download"])
+            continue;
+
+        NSString *jellyfinItemId =
+            parts[0];
+
+        if (!jellyfinItemId.length ||
+            ![storageKey hasSuffix:jellyfinItemId])
+            continue;
+
+        matchedServer = base;
+        matchedItemId = jellyfinItemId;
+        break;
+    }
+
+    if (!matchedServer.length ||
+        !matchedItemId.length) {
+
+        NSLog(
+            @"NineFin persistent job: server/item mismatch");
+
+        return nil;
+    }
+
+    /*
+     * Non usiamo NFToken globale:
+     * un altro server potrebbe essere selezionato.
+     */
+    NSDictionary *session =
+        NFReadSession(matchedServer);
+
+    NSString *token =
+        session[@"token"];
+
+    if (![token isKindOfClass:[NSString class]] ||
+        !token.length) {
+
+        NSLog(
+            @"NineFin persistent job: "
+             "Keychain session unavailable");
+
+        return nil;
+    }
+
+    /*
+     * Stesso formato MediaBrowser utilizzato
+     * dalle richieste normali di NineFin.
+     */
+    NSString *authorization =
+        [NSString stringWithFormat:
+            @"MediaBrowser Client=\"NineFin\", "
+             "Device=\"iPhone iOS9\", "
+             "DeviceId=\"%@\", Version=\"0.7.4\", "
+             "Token=\"%@\"",
+            NFDevice(),
+            token];
+
+    NSMutableURLRequest *request =
+        [NSMutableURLRequest requestWithURL:url];
+
+    request.HTTPMethod = @"GET";
+    request.timeoutInterval = 60.0;
+    request.cachePolicy =
+        NSURLRequestReloadIgnoringLocalCacheData;
+
+    [request setValue:authorization
+        forHTTPHeaderField:@"Authorization"];
+
+    [request setValue:
+        @"video/*,audio/*,application/octet-stream,*/*"
+        forHTTPHeaderField:@"Accept"];
+
+    /*
+     * Non logghiamo mai Authorization o il token.
+     */
+    NSLog(
+        @"NineFin persistent job: "
+         "authenticated request ready");
+
+    return request;
+}
+
 
 static void NFRequest(NSString *path, NSString *method,
                       NSDictionary *body, NFResult completion) {
@@ -1169,10 +1351,25 @@ static void NFAlert(UIViewController *vc,
     [vc presentViewController:a animated:YES completion:nil];
 }
 
+typedef void (^NFBackgroundSessionCompletion)();
+
 @interface NFAppDelegate : UIResponder <UIApplicationDelegate>
 @property (strong, nonatomic) UIWindow *window;
 - (void)showLogin;
 - (void)showLibrary;
+- (void)nfDownloadManagerCompleted:
+    (NSNotification *)notification;
+
+- (void)nfSeasonBatchFinished:
+    (NSNotification *)notification;
+
+- (void)nfDeliverSeasonSummaryInfo:
+    (NSDictionary *)info;
+
+- (void)nfReplaySeasonSummaries;
+
+- (void)nfRetryDownloadQueue:
+    (NSNotification *)notification;
 @end
 
 @interface NFServersController : UITableViewController
@@ -2308,6 +2505,308 @@ static NSURL *NFDownloadArtworkURL(
 }
 
 
+
+static NSString * const NFDownloadNotificationAskedKey =
+    @"NineFin.DownloadNotificationsAsked";
+
+
+static void __attribute__((unused))
+NFEnsureDownloadNotificationPermission(void) {
+
+    NSUserDefaults *defaults =
+        [NSUserDefaults standardUserDefaults];
+
+    if ([defaults boolForKey:
+            NFDownloadNotificationAskedKey]) {
+        return;
+    }
+
+    /*
+     * Segniamo subito la richiesta:
+     * iOS mostrerà il prompt solo questa volta.
+     */
+    [defaults setBool:YES
+        forKey:NFDownloadNotificationAskedKey];
+
+    [defaults synchronize];
+
+
+    UIUserNotificationType types =
+        UIUserNotificationTypeAlert |
+        UIUserNotificationTypeSound;
+
+    UIUserNotificationSettings *settings =
+        [UIUserNotificationSettings
+            settingsForTypes:types
+            categories:nil];
+
+    [[UIApplication sharedApplication]
+        registerUserNotificationSettings:
+            settings];
+
+    NSLog(
+        @"NineFin download notifications: "
+         @"permission requested");
+}
+
+
+static void __attribute__((unused))
+NFShowDownloadToast(NSString *message) {
+
+    if (!message.length)
+        return;
+
+    dispatch_async(
+        dispatch_get_main_queue(), ^{
+
+        UIApplication *app =
+            [UIApplication sharedApplication];
+
+        UIWindow *window =
+            app.keyWindow;
+
+        if (!window)
+            window = [app.windows firstObject];
+
+        if (!window)
+            return;
+
+
+        UIView *old =
+            [window viewWithTag:9073];
+
+        [old removeFromSuperview];
+
+
+        CGFloat maxWidth =
+            CGRectGetWidth(window.bounds) - 32.0;
+
+        CGFloat width =
+            MIN(maxWidth, 470.0);
+
+
+        UILabel *toast =
+            [[UILabel alloc]
+                initWithFrame:CGRectMake(
+                    (CGRectGetWidth(window.bounds) -
+                        width) / 2.0,
+                    32.0,
+                    width,
+                    48.0)];
+
+        toast.tag = 9073;
+
+        toast.text =
+            message;
+
+        toast.textAlignment =
+            NSTextAlignmentCenter;
+
+        toast.textColor =
+            [UIColor whiteColor];
+
+        toast.font =
+            [UIFont boldSystemFontOfSize:13.0];
+
+        toast.backgroundColor =
+            [UIColor colorWithWhite:0.08
+                              alpha:0.95];
+
+        toast.layer.cornerRadius =
+            9.0;
+
+        toast.clipsToBounds =
+            YES;
+
+        toast.alpha =
+            0.0;
+
+        [window addSubview:toast];
+
+
+        [UIView animateWithDuration:0.20
+            animations:^{
+                toast.alpha = 1.0;
+            }];
+
+
+        dispatch_after(
+            dispatch_time(
+                DISPATCH_TIME_NOW,
+                (int64_t)(2.5 *
+                    NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{
+
+            [UIView animateWithDuration:0.25
+                animations:^{
+                    toast.alpha = 0.0;
+                }
+                completion:^(BOOL finished) {
+                    (void)finished;
+                    [toast removeFromSuperview];
+                }];
+        });
+    });
+}
+
+
+static void __attribute__((unused))
+NFNotifyDownloadCompleted(NSString *title) {
+
+    NSString *safeTitle =
+        ([title isKindOfClass:[NSString class]] &&
+         title.length)
+            ? title
+            : @"Contenuto";
+
+    NSString *message =
+        [NSString stringWithFormat:
+            @"Download completato: %@",
+            safeTitle];
+
+
+    dispatch_async(
+        dispatch_get_main_queue(), ^{
+
+        UIApplication *app =
+            [UIApplication sharedApplication];
+
+
+        /*
+         * Se NineFin è visibile evitiamo una
+         * notifica di sistema ridondante.
+         */
+        /*
+         * Active o Inactive:
+         * NineFin è visibile oppure sta tornando
+         * in foreground. In entrambi i casi
+         * evitiamo notifiche di sistema fantasma.
+         */
+        if (app.applicationState !=
+                UIApplicationStateBackground) {
+
+            NFShowDownloadToast(message);
+            return;
+        }
+
+
+        /*
+         * Solo vero background:
+         * notifica locale iOS.
+         */
+        UILocalNotification *notification =
+            [[UILocalNotification alloc] init];
+
+        notification.alertBody =
+            message;
+
+        notification.alertAction =
+            @"Apri NineFin";
+
+        notification.hasAction =
+            YES;
+
+        notification.soundName =
+            UILocalNotificationDefaultSoundName;
+
+        notification.userInfo = @{
+            @"ninefin": @"download-complete"
+        };
+
+        /*
+         * Con una background NSURLSession che prosegue
+         * immediatamente con il prossimo elemento della FIFO,
+         * NineFin può restare sveglia in background per tutto
+         * il batch.
+         *
+         * Affidiamo quindi la consegna a SpringBoard con una
+         * vera local notification schedulata, invece di
+         * presentarla sincronicamente durante il wake corrente.
+         */
+        notification.fireDate =
+            [NSDate dateWithTimeIntervalSinceNow:1.0];
+
+        [app scheduleLocalNotification:
+            notification];
+
+
+        NSLog(
+            @"NineFin download notification scheduled: %@",
+            safeTitle);
+    });
+}
+
+
+
+/*
+ * Una sola notifica locale per batch.
+ *
+ * Foreground: toast.
+ * Background/inactive: UILocalNotification.
+ *
+ * Da chiamare sul main thread.
+ */
+static BOOL NFNotifySeasonBatchSummary(
+    NSString *message,
+    NSString *batchID) {
+
+    if (!message.length || !batchID.length)
+        return NO;
+
+    UIApplication *app =
+        [UIApplication sharedApplication];
+
+    if (app.applicationState == UIApplicationStateActive) {
+
+        UIWindow *window =
+            app.keyWindow ?: [app.windows firstObject];
+
+        if (!window)
+            return NO;
+
+        NFShowDownloadToast(message);
+        return YES;
+    }
+
+    /*
+     * Se una consegna è stata programmata prima
+     * di un'interruzione, non la programmiamo due volte.
+     */
+    for (UILocalNotification *existing
+         in [app scheduledLocalNotifications]) {
+
+        if ([existing.userInfo[@"ninefinSeasonBatchID"]
+                isEqualToString:batchID]) {
+            return YES;
+        }
+    }
+
+    UILocalNotification *notification =
+        [[UILocalNotification alloc] init];
+
+    notification.alertBody = message;
+    notification.alertAction = @"Apri NineFin";
+    notification.hasAction = YES;
+    notification.soundName =
+        UILocalNotificationDefaultSoundName;
+
+    notification.userInfo = @{
+        @"ninefin": @"season-summary",
+        @"ninefinSeasonBatchID": batchID
+    };
+
+    notification.fireDate =
+        [NSDate dateWithTimeIntervalSinceNow:1.0];
+
+    [app scheduleLocalNotification:notification];
+
+    NSLog(
+        @"NineFin season summary notification scheduled");
+
+    return YES;
+}
+
+
 static void NFSaveDownloadMetadata(
     NSDictionary *item,
     NSString *storageKey,
@@ -2431,6 +2930,360 @@ static void NFCacheDownloadArtwork(
         }] resume];
 }
 
+
+
+
+
+#pragma mark - Generic offline download helpers
+
+/*
+ * Genera la stessa chiave locale usata dal dettaglio,
+ * ma per un NSDictionary arbitrario.
+ *
+ * Serve per poter accodare gli episodi di una stagione
+ * senza creare un NFDetailsController per ciascuno.
+ */
+static NSString * __attribute__((unused))
+NFDownloadStorageKeyForItem(NSDictionary *item) {
+
+    NSString *itemId =
+        item[@"Id"];
+
+    if (![itemId isKindOfClass:[NSString class]] ||
+        !itemId.length) {
+
+        return @"";
+    }
+
+
+    NSString *server =
+        NFServer.length
+            ? NFServer
+            : @"server";
+
+
+    NSString *raw =
+        [NSString stringWithFormat:
+            @"%@__%@",
+            server,
+            itemId];
+
+
+    NSMutableString *safe =
+        [NSMutableString string];
+
+
+    NSCharacterSet *allowed =
+        [NSCharacterSet
+            alphanumericCharacterSet];
+
+
+    BOOL previousUnderscore =
+        NO;
+
+
+    for (NSUInteger i = 0;
+         i < raw.length;
+         i++) {
+
+        unichar c =
+            [raw characterAtIndex:i];
+
+        if ([allowed
+                characterIsMember:c]) {
+
+            [safe appendFormat:@"%C", c];
+
+            previousUnderscore =
+                NO;
+
+        } else if (!previousUnderscore) {
+
+            [safe appendString:@"_"];
+
+            previousUnderscore =
+                YES;
+        }
+    }
+
+
+    while ([safe hasSuffix:@"_"] &&
+           safe.length) {
+
+        [safe deleteCharactersInRange:
+            NSMakeRange(
+                safe.length - 1,
+                1)];
+    }
+
+
+    /*
+     * Stesso limite già usato dal download singolo.
+     */
+    if (safe.length > 180) {
+
+        NSString *head =
+            [safe substringToIndex:95];
+
+        NSString *tail =
+            [safe substringFromIndex:
+                safe.length - 80];
+
+        safe =
+            [[NSString stringWithFormat:
+                @"%@_%@",
+                head,
+                tail]
+                mutableCopy];
+    }
+
+
+    return safe;
+}
+
+
+/*
+ * Ricava l'estensione dell'originale.
+ *
+ * preferredExtension viene usata dal dettaglio singolo,
+ * che può averla già appresa da PlaybackInfo.
+ *
+ * Per il batch stagione passeremo nil e useremo
+ * direttamente Container dell'episodio.
+ */
+static NSString * __attribute__((unused))
+NFDownloadExtensionForItem(
+    NSDictionary *item,
+    NSString *preferredExtension) {
+
+    NSString *container =
+        preferredExtension;
+
+
+    if (![container
+            isKindOfClass:[NSString class]] ||
+        !container.length) {
+
+        container =
+            item[@"Container"];
+    }
+
+
+    if (![container
+            isKindOfClass:[NSString class]] ||
+        !container.length) {
+
+        return @"media";
+    }
+
+
+    NSString *first =
+        [[container
+            componentsSeparatedByString:@","]
+            firstObject];
+
+
+    first =
+        [first
+            stringByTrimmingCharactersInSet:
+                [NSCharacterSet
+                    whitespaceAndNewlineCharacterSet]];
+
+
+    return first.length
+        ? first.lowercaseString
+        : @"media";
+}
+
+
+/*
+ * Accoda il file originale di un item Jellyfin
+ * usando tutta l'infrastruttura già esistente:
+ *
+ * - metadata offline
+ * - artwork
+ * - Authorization
+ * - FIFO
+ * - background NSURLSession
+ * - taskDescription persistente
+ * - notifica di completamento
+ */
+static BOOL __attribute__((unused))
+NFEnqueueOriginalDownloadForItem(
+    NSDictionary *item,
+    NSString *preferredExtension,
+    NFDownloadProgressBlock progress,
+    NFDownloadCompletionBlock completion) {
+
+    if (![item
+            isKindOfClass:[NSDictionary class]]) {
+
+        return NO;
+    }
+
+
+    NSString *itemId =
+        item[@"Id"];
+
+
+    if (![itemId
+            isKindOfClass:[NSString class]] ||
+        !itemId.length) {
+
+        return NO;
+    }
+
+
+    NSString *storageKey =
+        NFDownloadStorageKeyForItem(
+            item);
+
+
+    if (!storageKey.length)
+        return NO;
+
+
+    NSString *extension =
+        NFDownloadExtensionForItem(
+            item,
+            preferredExtension);
+
+
+    NFDownloadManager *downloads =
+        [NFDownloadManager
+            sharedManager];
+
+
+    /*
+     * Questo helper è idempotente:
+     * non duplica un file già locale né un task
+     * già presente nella FIFO.
+     */
+    if ([downloads
+            isDownloadingItemId:
+                storageKey]) {
+
+        return NO;
+    }
+
+
+    if ([downloads
+            isDownloadedItemId:
+                storageKey
+            fileExtension:
+                extension]) {
+
+        return NO;
+    }
+
+
+    NFSaveDownloadMetadata(
+        item,
+        storageKey,
+        extension);
+
+
+    NFCacheDownloadArtwork(
+        itemId,
+        storageKey,
+        extension);
+
+
+    NSString *path =
+        [NSString stringWithFormat:
+            @"/Items/%@/Download",
+            itemId];
+
+
+    NSURL *url =
+        NFURL(path);
+
+
+    if (!url) {
+
+        NSError *error =
+            [NSError
+                errorWithDomain:
+                    @"dev.luke.ninefin.download"
+                code:4
+                userInfo:@{
+                    NSLocalizedDescriptionKey:
+                        @"URL Jellyfin non valida."
+                }];
+
+
+        if (completion) {
+
+            dispatch_async(
+                dispatch_get_main_queue(), ^{
+
+                completion(
+                    nil,
+                    error);
+            });
+        }
+
+        return NO;
+    }
+
+
+    NSMutableURLRequest *request =
+        [NSMutableURLRequest
+            requestWithURL:url];
+
+
+    request.HTTPMethod =
+        @"GET";
+
+    request.timeoutInterval =
+        60.0;
+
+
+    NFHeaders(request);
+
+
+    [request
+        setValue:
+            @"video/*,audio/*,"
+             "application/octet-stream,*/*"
+        forHTTPHeaderField:
+            @"Accept"];
+
+
+    NSString *title =
+        item[@"Name"];
+
+
+    if (![title
+            isKindOfClass:[NSString class]] ||
+        !title.length) {
+
+        title =
+            @"Contenuto";
+    }
+
+
+    /*
+     * Il flag NSUserDefaults impedisce che
+     * venga richiesto più volte.
+     */
+    NFEnsureDownloadNotificationPermission();
+
+
+    return [downloads
+        enqueueDownloadWithRequest:
+            request
+        itemId:
+            storageKey
+        fileExtension:
+            extension
+        displayTitle:
+            title
+        progress:
+            progress
+        completion:
+            completion];
+}
 
 
 @interface NFHomeController : NFLibraryController
@@ -3998,6 +4851,22 @@ static void NFCacheDownloadArtwork(
     [self renderHeader];
     [self reloadDetails];
 
+    [[NSNotificationCenter defaultCenter]
+        addObserver:self
+        selector:
+            @selector(nfSeasonDownloadStateChanged:)
+        name:
+            NFDownloadManagerDidCompleteNotification
+        object:nil];
+
+    [[NSNotificationCenter defaultCenter]
+        addObserver:self
+        selector:
+            @selector(nfSeasonDownloadStateChanged:)
+        name:
+            NFDownloadManagerQueueDidChangeNotification
+        object:nil];
+
     if ([self isSeries])
         [self loadSeasons];
 }
@@ -4014,6 +4883,12 @@ static void NFCacheDownloadArtwork(
 
     self.appeared = YES;
 }
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter]
+        removeObserver:self];
+}
+
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
@@ -4431,17 +5306,54 @@ static void NFCacheDownloadArtwork(
             download.titleLabel.font =
                 [UIFont systemFontOfSize:14];
 
+            BOOL queued = NO;
+
+            if (downloading &&
+                storageKey.length) {
+
+                NSArray *active =
+                    [[NFDownloadManager sharedManager]
+                        activeDownloads];
+
+                for (NSDictionary *entry in active) {
+
+                    NSString *entryItemId =
+                        entry[@"itemId"];
+
+                    if ([entryItemId
+                            isKindOfClass:[NSString class]] &&
+                        [entryItemId
+                            isEqualToString:storageKey]) {
+
+                        queued =
+                            [entry[@"queued"] boolValue];
+
+                        break;
+                    }
+                }
+            }
+
+
             NSString *downloadTitle = nil;
 
             if (downloading) {
-                downloadTitle =
-                    [NSString stringWithFormat:
-                        @"↓ Download in corso · %ld%% · Annulla",
-                        (long)self.nfDownloadPercent];
 
-                download.contentEdgeInsets =
-                    UIEdgeInsetsMake(
-                        0, 0, 14, 0);
+                if (queued) {
+
+                    downloadTitle =
+                        @"↓ In attesa · Annulla";
+
+                } else {
+
+                    downloadTitle =
+                        [NSString stringWithFormat:
+                            @"↓ Download in corso · %ld%% · Annulla",
+                            (long)self.nfDownloadPercent];
+
+                    download.contentEdgeInsets =
+                        UIEdgeInsetsMake(
+                            0, 0, 14, 0);
+                }
 
             } else if (downloaded) {
                 downloadTitle =
@@ -4467,7 +5379,7 @@ static void NFCacheDownloadArtwork(
 
             self.nfDownloadButton = download;
 
-            if (downloading) {
+            if (downloading && !queued) {
                 UIProgressView *progress =
                     [[UIProgressView alloc]
                         initWithProgressViewStyle:
@@ -4502,7 +5414,10 @@ static void NFCacheDownloadArtwork(
                     progress;
             }
 
-            bottom += downloading ? 70 : 55;
+            bottom +=
+                (downloading && !queued)
+                    ? 70
+                    : 55;
         }
     }
 
@@ -4644,66 +5559,27 @@ static void NFCacheDownloadArtwork(
     /*
      * NUOVO DOWNLOAD
      *
-     * Endpoint ufficiale Jellyfin:
-     * GET /Items/{itemId}/Download
+     * Metadata, artwork, request Jellyfin,
+     * Authorization, notifiche e enqueue FIFO
+     * vengono ora gestiti dall'helper generico.
      *
-     * Autenticazione tramite lo stesso Authorization header
-     * usato dal resto di NineFin.
+     * Qui rimane soltanto la UI specifica
+     * del dettaglio aperto.
      */
-    NFSaveDownloadMetadata(
-        self.item,
-        storageKey,
-        extension);
-
-    NFCacheDownloadArtwork(
-        itemId,
-        storageKey,
-        extension);
-
-    NSString *path =
-        [NSString stringWithFormat:
-            @"/Items/%@/Download",
-            itemId];
-
-    NSURL *url = NFURL(path);
-
-    if (!url) {
-        NFAlert(self,
-            @"Download",
-            @"URL Jellyfin non valida.");
-        return;
-    }
-
-    NSMutableURLRequest *request =
-        [NSMutableURLRequest
-            requestWithURL:url];
-
-    request.HTTPMethod = @"GET";
-    request.timeoutInterval = 60.0;
-
-    NFHeaders(request);
-
-    /*
-     * NFHeaders usa application/json per le API normali.
-     * Qui aspettiamo invece un media binario.
-     */
-    [request setValue:
-        @"video/*,audio/*,application/octet-stream,*/*"
-        forHTTPHeaderField:@"Accept"];
-
-    NSString *server = [NFServer copy];
+    NSString *server =
+        [NFServer copy];
 
     self.nfDownloadPercent = 0;
 
     __weak NFDetailsController *weakSelf =
         self;
 
-    NSURLSessionDownloadTask *task =
-        [downloads
-            startDownloadWithRequest:request
-            itemId:storageKey
-            fileExtension:extension
-            progress:^(
+
+    BOOL enqueued =
+        NFEnqueueOriginalDownloadForItem(
+            self.item,
+            extension,
+            ^(
                 int64_t bytesWritten,
                 int64_t totalBytesWritten,
                 int64_t totalBytesExpectedToWrite) {
@@ -4778,14 +5654,24 @@ static void NFCacheDownloadArtwork(
                         forState:UIControlStateNormal];
                 }
 
-            }
-            completion:^(
+            },
+            ^(
                 NSURL *localURL,
                 NSError *error) {
 
+                /*
+                 * Notifica/completion globale gestita ora
+                 * da NFDownloadManager.
+                 *
+                 * Qui rimane soltanto la UI del dettaglio.
+                 */
                 NFDetailsController *vc =
                     weakSelf;
 
+                /*
+                 * Da qui in poi gestiamo soltanto
+                 * l'eventuale UI del dettaglio ancora aperto.
+                 */
                 if (!vc)
                     return;
 
@@ -4797,10 +5683,14 @@ static void NFCacheDownloadArtwork(
                 if (!sameScreen)
                     return;
 
+
                 vc.nfDownloadPercent = 0;
+
                 [vc renderHeader];
 
+
                 if (error) {
+
                     /*
                      * La cancellazione richiesta dall'utente
                      * non deve produrre un popup di errore.
@@ -4809,25 +5699,25 @@ static void NFCacheDownloadArtwork(
                         NSURLErrorCancelled)
                         return;
 
-                    NFAlert(vc,
+                    NFAlert(
+                        vc,
                         @"Download fallito",
                         error.localizedDescription);
+
                     return;
                 }
 
-                if (localURL) {
-                    NSString *message =
-                        [NSString stringWithFormat:
-                            @"Copia offline salvata correttamente.\n\n%@",
-                            localURL.lastPathComponent];
 
-                    NFAlert(vc,
-                        @"Download completato",
-                        message);
-                }
-            }];
+                /*
+                 * Il vecchio popup di successo è stato
+                 * sostituito da:
+                 *
+                 * - toast NineFin in foreground
+                 * - notifica locale iOS in background
+                 */
+            });
 
-    if (!task) {
+    if (!enqueued) {
         [self renderHeader];
         return;
     }
@@ -5072,7 +5962,9 @@ static void NFCacheDownloadArtwork(
     NSString *path = [NSString stringWithFormat:
         @"/Shows/%@/Episodes?"
          "UserId=%@&SeasonId=%@"
-         "&Fields=Overview,UserData",
+         "&Fields=Overview,UserData,Container,"
+         "SeriesName,ParentIndexNumber,IndexNumber,"
+         "RunTimeTicks",
         self.item[@"Id"], user, seasonId];
 
     __weak NFDetailsController *weakSelf = self;
@@ -5104,6 +5996,416 @@ static void NFCacheDownloadArtwork(
     });
 }
 
+
+#pragma mark - Season offline management
+
+- (NSDictionary *)nfQueueEntryForStorageKey:
+    (NSString *)storageKey {
+
+    if (!storageKey.length)
+        return nil;
+
+
+    NSArray *active =
+        [[NFDownloadManager sharedManager]
+            activeDownloads];
+
+
+    for (NSDictionary *entry in active) {
+
+        NSString *entryItemId =
+            entry[@"itemId"];
+
+
+        if ([entryItemId
+                isKindOfClass:[NSString class]] &&
+            [entryItemId
+                isEqualToString:storageKey]) {
+
+            return entry;
+        }
+    }
+
+
+    return nil;
+}
+
+
+- (NSDictionary *)nfSeasonDownloadSummary {
+
+    NFDownloadManager *downloads =
+        [NFDownloadManager sharedManager];
+
+    NSInteger offline = 0;
+    NSInteger active = 0;
+    NSInteger queued = 0;
+    NSInteger missing = 0;
+
+
+    for (NSDictionary *episode in self.episodes) {
+
+        if (![episode
+                isKindOfClass:[NSDictionary class]])
+            continue;
+
+
+        NSString *storageKey =
+            NFDownloadStorageKeyForItem(
+                episode);
+
+        NSString *extension =
+            NFDownloadExtensionForItem(
+                episode,
+                nil);
+
+
+        if (!storageKey.length)
+            continue;
+
+
+        if ([downloads
+                isDownloadedItemId:storageKey
+                fileExtension:extension]) {
+
+            offline++;
+            continue;
+        }
+
+
+        NSDictionary *queueEntry =
+            [self
+                nfQueueEntryForStorageKey:
+                    storageKey];
+
+
+        if (queueEntry) {
+
+            if ([queueEntry[@"queued"]
+                    boolValue]) {
+
+                queued++;
+
+            } else {
+
+                active++;
+            }
+
+            continue;
+        }
+
+
+        missing++;
+    }
+
+
+    return @{
+        @"offline": @(offline),
+        @"active": @(active),
+        @"queued": @(queued),
+        @"missing": @(missing),
+        @"total":
+            @(offline +
+              active +
+              queued +
+              missing)
+    };
+}
+
+
+- (NSArray *)nfMissingEpisodes {
+
+    NFDownloadManager *downloads =
+        [NFDownloadManager sharedManager];
+
+    NSMutableArray *result =
+        [NSMutableArray array];
+
+
+    for (NSDictionary *episode in self.episodes) {
+
+        if (![episode
+                isKindOfClass:[NSDictionary class]])
+            continue;
+
+
+        NSString *storageKey =
+            NFDownloadStorageKeyForItem(
+                episode);
+
+        NSString *extension =
+            NFDownloadExtensionForItem(
+                episode,
+                nil);
+
+
+        if (!storageKey.length)
+            continue;
+
+
+        if ([downloads
+                isDownloadedItemId:storageKey
+                fileExtension:extension])
+            continue;
+
+
+        if ([downloads
+                isDownloadingItemId:storageKey])
+            continue;
+
+
+        [result addObject:episode];
+    }
+
+
+    return result;
+}
+
+
+- (NSDictionary *)nfSelectedSeason {
+
+    for (NSDictionary *season in self.seasons) {
+
+        if ([season[@"Id"]
+                isEqualToString:self.seasonId]) {
+
+            return season;
+        }
+    }
+
+    return nil;
+}
+
+
+- (void)nfSeasonDownloadStateChanged:
+    (NSNotification *)notification {
+
+    (void)notification;
+
+
+    if (![NSThread isMainThread]) {
+
+        __weak NFDetailsController *weakSelf =
+            self;
+
+        dispatch_async(
+            dispatch_get_main_queue(), ^{
+
+            NFDetailsController *vc =
+                weakSelf;
+
+            if (!vc ||
+                ![vc isSeries])
+                return;
+
+            [vc.tableView reloadData];
+        });
+
+        return;
+    }
+
+
+    if (![self isSeries])
+        return;
+
+
+    [self.tableView reloadData];
+}
+
+
+- (void)nfDownloadMissingEpisodesPressed {
+
+    if (!self.episodes.count) {
+
+        NFAlert(
+            self,
+            @"Scarica stagione",
+            @"Nessun episodio disponibile.");
+
+        return;
+    }
+
+
+    NSDictionary *summary =
+        [self nfSeasonDownloadSummary];
+
+    NSInteger offline =
+        [summary[@"offline"] integerValue];
+
+    NSInteger active =
+        [summary[@"active"] integerValue];
+
+    NSInteger queued =
+        [summary[@"queued"] integerValue];
+
+    NSArray *missing =
+        [self nfMissingEpisodes];
+
+
+    if (!missing.count) {
+
+        if ((active + queued) > 0) {
+
+            NFAlert(
+                self,
+                @"Download già in coda",
+                @"Tutti gli episodi mancanti "
+                 "sono già nella coda download.");
+
+        } else {
+
+            NFAlert(
+                self,
+                @"Stagione offline",
+                @"Tutti gli episodi della stagione "
+                 "sono già disponibili offline.");
+        }
+
+        return;
+    }
+
+
+    NSDictionary *season =
+        [self nfSelectedSeason];
+
+    NSString *seasonName =
+        season[@"Name"];
+
+    if (![seasonName
+            isKindOfClass:[NSString class]] ||
+        !seasonName.length) {
+
+        seasonName =
+            @"questa stagione";
+    }
+
+
+    NSString *message =
+        [NSString stringWithFormat:
+            @"%@\n\n"
+             "%lu episodi verranno aggiunti alla coda.\n"
+             "%ld già offline · %ld in corso · %ld già in coda",
+            seasonName,
+            (unsigned long)missing.count,
+            (long)offline,
+            (long)active,
+            (long)queued];
+
+
+    UIAlertController *confirm =
+        [UIAlertController
+            alertControllerWithTitle:
+                @"Scarica episodi mancanti"
+            message:
+                message
+            preferredStyle:
+                UIAlertControllerStyleAlert];
+
+
+    [confirm addAction:
+        [UIAlertAction
+            actionWithTitle:@"Annulla"
+            style:UIAlertActionStyleCancel
+            handler:nil]];
+
+
+    __weak NFDetailsController *weakSelf =
+        self;
+
+
+    [confirm addAction:
+        [UIAlertAction
+            actionWithTitle:@"Scarica"
+            style:UIAlertActionStyleDefault
+            handler:^(UIAlertAction *action) {
+
+                (void)action;
+
+                NFDetailsController *vc =
+                    weakSelf;
+
+                if (!vc)
+                    return;
+
+
+                NFDownloadManager *downloads =
+                    [NFDownloadManager sharedManager];
+
+                NSMutableArray *plannedIDs =
+                    [NSMutableArray array];
+
+                for (NSDictionary *episode in missing) {
+                    NSString *key =
+                        NFDownloadStorageKeyForItem(episode);
+
+                    if (key.length)
+                        [plannedIDs addObject:key];
+                }
+
+                NSString *seriesName =
+                    [vc.item[@"Name"] isKindOfClass:[NSString class]]
+                        ? vc.item[@"Name"] : @"Serie";
+
+                NSString *batchTitle =
+                    [NSString stringWithFormat:
+                        @"%@ - %@", seriesName, seasonName];
+
+                NSString *batchID =
+                    [downloads beginSeasonNotificationBatchWithTitle:batchTitle
+                                                              itemIds:plannedIDs];
+
+                NSMutableArray *acceptedIDs =
+                    [NSMutableArray array];
+
+                NSInteger added = 0;
+
+                for (NSDictionary *episode in missing) {
+
+                    BOOL enqueued =
+                        NFEnqueueOriginalDownloadForItem(
+                            episode,
+                            nil,
+                            nil,
+                            nil);
+
+                    if (enqueued) {
+                        added++;
+
+                        NSString *key =
+                            NFDownloadStorageKeyForItem(episode);
+
+                        if (key.length)
+                            [acceptedIDs addObject:key];
+                    }
+                }
+
+                [downloads finishSeasonNotificationBatch:batchID
+                                          acceptedItemIds:acceptedIDs];
+
+                [vc.tableView reloadData];
+
+
+                NSString *resultMessage =
+                    added == 1
+                        ? @"1 episodio aggiunto alla coda."
+                        : [NSString stringWithFormat:
+                            @"%ld episodi aggiunti alla coda.",
+                            (long)added];
+
+
+                NFAlert(
+                    vc,
+                    @"Download accodati",
+                    resultMessage);
+            }]];
+
+
+    [self presentViewController:
+        confirm
+        animated:YES
+        completion:nil];
+}
+
+
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)table {
     return [self isSeries] ? 2 : 0;
 }
@@ -5115,7 +6417,9 @@ static void NFCacheDownloadArtwork(
         return self.seasons.count;
 
     if (section == 1)
-        return self.episodes.count;
+        return self.episodes.count
+            ? self.episodes.count + 1
+            : 0;
 
     return 0;
 }
@@ -5168,29 +6472,175 @@ static void NFCacheDownloadArtwork(
         cell.tintColor = NFAccent();
 
     } else {
-        NSDictionary *episode = self.episodes[path.row];
+
+        /*
+         * Prima riga della sezione:
+         * gestione offline dell'intera stagione.
+         */
+        if (path.row == 0) {
+
+            NSDictionary *summary =
+                [self nfSeasonDownloadSummary];
+
+            NSInteger offline =
+                [summary[@"offline"] integerValue];
+
+            NSInteger active =
+                [summary[@"active"] integerValue];
+
+            NSInteger queued =
+                [summary[@"queued"] integerValue];
+
+            NSInteger missing =
+                [summary[@"missing"] integerValue];
+
+            NSInteger total =
+                [summary[@"total"] integerValue];
+
+
+            cell.textLabel.text =
+                missing > 0
+                    ? @"↓ Scarica episodi mancanti"
+                    : ((active + queued) > 0
+                        ? @"↓ Download stagione in corso"
+                        : @"✓ Stagione disponibile offline");
+
+
+            if (missing > 0) {
+
+                cell.detailTextLabel.text =
+                    [NSString stringWithFormat:
+                        @"%ld/%ld offline · %ld in corso · "
+                         "%ld in coda · %ld da scaricare",
+                        (long)offline,
+                        (long)total,
+                        (long)active,
+                        (long)queued,
+                        (long)missing];
+
+                cell.textLabel.textColor =
+                    NFAccent();
+
+            } else if ((active + queued) > 0) {
+
+                cell.detailTextLabel.text =
+                    [NSString stringWithFormat:
+                        @"%ld/%ld offline · %ld in corso · "
+                         "%ld in coda",
+                        (long)offline,
+                        (long)total,
+                        (long)active,
+                        (long)queued];
+
+                cell.textLabel.textColor =
+                    NFAccent();
+
+            } else {
+
+                cell.detailTextLabel.text =
+                    [NSString stringWithFormat:
+                        @"%ld/%ld episodi offline",
+                        (long)offline,
+                        (long)total];
+            }
+
+
+            cell.accessoryType =
+                UITableViewCellAccessoryNone;
+
+            return cell;
+        }
+
+
+        NSDictionary *episode =
+            self.episodes[path.row - 1];
 
         NSString *name =
             episode[@"Name"] ?: @"Episodio";
 
-        NSNumber *number = episode[@"IndexNumber"];
+        NSNumber *number =
+            episode[@"IndexNumber"];
 
-        cell.textLabel.text = number
-            ? [NSString stringWithFormat:
-                @"E%@ · %@", number, name]
-            : name;
+        cell.textLabel.text =
+            number
+                ? [NSString stringWithFormat:
+                    @"E%@ · %@", number, name]
+                : name;
 
-        NSDictionary *data = episode[@"UserData"];
 
-        if ([data[@"Played"] boolValue]) {
-            cell.detailTextLabel.text = @"✓ Visto";
-        } else if ([data[@"PlaybackPositionTicks"]
-                    longLongValue] > 0) {
-            cell.detailTextLabel.text = @"Da riprendere";
-        } else {
+        NSString *storageKey =
+            NFDownloadStorageKeyForItem(
+                episode);
+
+        NSString *extension =
+            NFDownloadExtensionForItem(
+                episode,
+                nil);
+
+        NFDownloadManager *downloads =
+            [NFDownloadManager sharedManager];
+
+
+        BOOL downloaded =
+            storageKey.length &&
+            [downloads
+                isDownloadedItemId:storageKey
+                fileExtension:extension];
+
+        NSDictionary *queueEntry =
+            storageKey.length
+                ? [self
+                    nfQueueEntryForStorageKey:
+                        storageKey]
+                : nil;
+
+        BOOL downloading =
+            queueEntry != nil;
+
+        BOOL queued =
+            downloading &&
+            [queueEntry[@"queued"]
+                boolValue];
+
+
+        if (downloaded) {
+
             cell.detailTextLabel.text =
-                @"Tocca per i dettagli";
+                @"✓ Disponibile offline";
+
+        } else if (downloading) {
+
+            cell.detailTextLabel.text =
+                queued
+                    ? @"⏳ In coda"
+                    : @"↓ Download in corso";
+
+            cell.detailTextLabel.textColor =
+                NFAccent();
+
+        } else {
+
+            NSDictionary *data =
+                episode[@"UserData"];
+
+            if ([data[@"Played"] boolValue]) {
+
+                cell.detailTextLabel.text =
+                    @"✓ Visto";
+
+            } else if ([data[@"PlaybackPositionTicks"]
+                        longLongValue] > 0) {
+
+                cell.detailTextLabel.text =
+                    @"Da riprendere";
+
+            } else {
+
+                cell.detailTextLabel.text =
+                    @"Tocca per i dettagli";
+            }
         }
+
 
         cell.accessoryType =
             UITableViewCellAccessoryDisclosureIndicator;
@@ -5218,7 +6668,18 @@ static void NFCacheDownloadArtwork(
     }
 
     if (path.section == 1) {
-        NSDictionary *episode = self.episodes[path.row];
+
+        if (path.row == 0) {
+
+            [self
+                nfDownloadMissingEpisodesPressed];
+
+            return;
+        }
+
+
+        NSDictionary *episode =
+            self.episodes[path.row - 1];
 
         NFDetailsController *next =
             [[NFDetailsController alloc]
@@ -5234,8 +6695,135 @@ static void NFCacheDownloadArtwork(
 
 @implementation NFAppDelegate
 
+/*
+ * La richiesta di retry è sicura anche se:
+ *
+ * - il restore non è ancora terminato;
+ * - esiste già un trasferimento attivo;
+ * - la FIFO è vuota.
+ *
+ * Il manager esegue tutti i controlli.
+ */
+
+- (void)nfDeliverSeasonSummaryInfo:
+    (NSDictionary *)info {
+
+    NSString *batchID = info[@"batchID"];
+    NSString *message = info[@"message"];
+
+    if (![batchID isKindOfClass:[NSString class]] ||
+        ![message isKindOfClass:[NSString class]] ||
+        !batchID.length || !message.length)
+        return;
+
+    NFDownloadManager *manager =
+        [NFDownloadManager sharedManager];
+
+    /*
+     * Un evento già confermato non deve generare
+     * una seconda notifica.
+     */
+    BOOL stillPending = NO;
+
+    for (NSDictionary *pending
+         in [manager pendingSeasonNotificationSummaries]) {
+
+        if ([pending[@"batchID"]
+                isEqualToString:batchID]) {
+
+            stillPending = YES;
+            break;
+        }
+    }
+
+    if (!stillPending)
+        return;
+
+    if (NFNotifySeasonBatchSummary(message, batchID)) {
+
+        [manager acknowledgeSeasonNotificationSummary:
+            batchID];
+
+        NSLog(
+            @"NineFin season summary delivered");
+    }
+}
+
+
+- (void)nfSeasonBatchFinished:
+    (NSNotification *)notification {
+
+    NSDictionary *info =
+        [notification.userInfo copy];
+
+    if (![NSThread isMainThread]) {
+
+        __weak NFAppDelegate *weakSelf = self;
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf nfDeliverSeasonSummaryInfo:info];
+        });
+
+        return;
+    }
+
+    [self nfDeliverSeasonSummaryInfo:info];
+}
+
+
+- (void)nfReplaySeasonSummaries {
+
+    NSArray *pending =
+        [[NFDownloadManager sharedManager]
+            pendingSeasonNotificationSummaries];
+
+    for (NSDictionary *info in pending) {
+        [self nfDeliverSeasonSummaryInfo:info];
+    }
+}
+
+
+- (void)nfRetryDownloadQueue:
+    (NSNotification *)notification {
+
+    NSLog(
+        @"NineFin background retry trigger: %@",
+        notification.name);
+
+    [[NFDownloadManager sharedManager]
+        retryPendingDownloads];
+
+    if ([UIApplication sharedApplication].applicationState ==
+            UIApplicationStateActive) {
+
+        [self nfReplaySeasonSummaries];
+    }
+}
+
+
+
 - (BOOL)application:(UIApplication *)application
  didFinishLaunchingWithOptions:(NSDictionary *)options {
+
+    /*
+     * Va registrato prima che NFDownloadManager venga
+     * istanziato: durante un relaunch background iOS può
+     * avere già eventi pronti da consegnare.
+     */
+    [[NSNotificationCenter defaultCenter]
+        addObserver:self
+        selector:
+            @selector(nfDownloadManagerCompleted:)
+        name:
+            NFDownloadManagerDidCompleteNotification
+        object:nil];
+
+    [[NSNotificationCenter defaultCenter]
+        addObserver:self
+        selector:@selector(nfSeasonBatchFinished:)
+        name:NFDownloadManagerSeasonBatchDidFinishNotification
+        object:nil];
+
     self.window = [[UIWindow alloc]
         initWithFrame:[UIScreen mainScreen].bounds];
 
@@ -5252,6 +6840,43 @@ static void NFCacheDownloadArtwork(
         UIStatusBarStyleLightContent;
 
     NFRestore();
+
+    /*
+     * Dopo NFRestore, le sessioni salvate sono
+     * recuperabili dal Keychain.
+     *
+     * Il manager non riceve mai il token:
+     * riceve soltanto una richiesta autenticata
+     * quando deve materializzare un job.
+     */
+    [[NFDownloadManager sharedManager]
+        configurePersistedDownloadRequestBuilder:
+            ^NSMutableURLRequest *(
+                NSDictionary *job) {
+
+                return
+                    NFRequestForPersistedDownloadJob(
+                        job);
+            }];
+
+    /*
+     * Ripresa automatica quando l'app torna attiva
+     * oppure iOS rende accessibili i dati protetti.
+     *
+     * Fondamentale per Keychain AfterFirstUnlock
+     * dopo un riavvio completo del dispositivo.
+     */
+    [[NSNotificationCenter defaultCenter]
+        addObserver:self
+        selector:@selector(nfRetryDownloadQueue:)
+        name:UIApplicationDidBecomeActiveNotification
+        object:nil];
+
+    [[NSNotificationCenter defaultCenter]
+        addObserver:self
+        selector:@selector(nfRetryDownloadQueue:)
+        name:UIApplicationProtectedDataDidBecomeAvailable
+        object:nil];
 
     BOOL hasDownloads =
         [NFDownloadManager sharedManager]
@@ -5321,8 +6946,83 @@ static void NFCacheDownloadArtwork(
     }
 
     [self.window makeKeyAndVisible];
+
+    /*
+     * Recupera eventuali riepiloghi completati
+     * prima di una precedente interruzione.
+     */
+    [self nfReplaySeasonSummaries];
+
     return YES;
 }
+
+
+
+- (void)nfDownloadManagerCompleted:
+    (NSNotification *)notification {
+
+    if (![NSThread isMainThread]) {
+
+        __weak NFAppDelegate *weakSelf =
+            self;
+
+        dispatch_async(
+            dispatch_get_main_queue(), ^{
+
+            NFAppDelegate *app =
+                weakSelf;
+
+            if (app) {
+                [app
+                    nfDownloadManagerCompleted:
+                        notification];
+            }
+        });
+
+        return;
+    }
+
+
+    NSString *title =
+        notification.userInfo[@"title"];
+
+    if (![title isKindOfClass:
+            [NSString class]] ||
+        !title.length) {
+
+        title =
+            @"Contenuto";
+    }
+
+    /*
+     * Questa funzione decide già correttamente:
+     *
+     * foreground -> toast NineFin
+     * background -> UILocalNotification
+     */
+    NFNotifyDownloadCompleted(
+        title);
+}
+
+
+- (void)application:(UIApplication *)application
+ handleEventsForBackgroundURLSession:(NSString *)identifier
+ completionHandler:(NFBackgroundSessionCompletion)completionHandler {
+
+    (void)application;
+
+    NSLog(
+        @"NineFin background: wake for session %@",
+        identifier ?: @"<nil>");
+
+
+    [[NFDownloadManager sharedManager]
+        handleBackgroundEventsForSessionIdentifier:
+            identifier
+        completionHandler:
+            completionHandler];
+}
+
 
 - (void)showLogin {
     NFLoginController *login =

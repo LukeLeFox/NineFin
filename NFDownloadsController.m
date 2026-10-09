@@ -682,7 +682,16 @@ static void *NFOfflineResumeContext =
 
     [self reloadDownloads];
 
-    if (!self.downloadRefreshTimer) {
+    /*
+     * Il refresh al secondo serve soltanto mentre
+     * esistono download attivi.
+     *
+     * Senza download non ha senso ridisegnare
+     * continuamente una schermata statica.
+     */
+    if (self.activeDownloads.count &&
+        !self.downloadRefreshTimer) {
+
         self.downloadRefreshTimer =
             [NSTimer
                 scheduledTimerWithTimeInterval:1.0
@@ -703,7 +712,63 @@ static void *NFOfflineResumeContext =
 
 
 - (void)refreshDownloadUI {
-    [self reloadDownloads];
+
+    NFDownloadManager *manager =
+        [NFDownloadManager sharedManager];
+
+
+    NSArray *updatedFiles =
+        [manager downloadedFiles] ?: @[];
+
+    NSArray *updatedActive =
+        [manager activeDownloads] ?: @[];
+
+
+    NSArray *currentFiles =
+        self.files ?: @[];
+
+
+    /*
+     * reloadData chiude automaticamente lo swipe-to-delete.
+     *
+     * Lo eseguiamo quindi soltanto se il contenuto reale
+     * della lista Scaricati è cambiato.
+     */
+    BOOL filesChanged =
+        ![currentFiles
+            isEqualToArray:updatedFiles];
+
+
+    self.files =
+        updatedFiles;
+
+    self.activeDownloads =
+        updatedActive;
+
+
+    /*
+     * La testata della coda può continuare invece
+     * ad aggiornarsi ogni secondo per mostrare progress
+     * e passaggio In coda -> Download in corso.
+     */
+    [self renderActiveDownloadsHeader];
+
+
+    if (filesChanged) {
+        [self.tableView reloadData];
+    }
+
+
+    /*
+     * Finita tutta la FIFO non serve più alcun polling.
+     */
+    if (!updatedActive.count) {
+
+        [self.downloadRefreshTimer invalidate];
+
+        self.downloadRefreshTimer =
+            nil;
+    }
 }
 
 
@@ -723,29 +788,42 @@ static void *NFOfflineResumeContext =
 
 
 - (void)renderActiveDownloadsHeader {
+
     NSArray *downloads =
         self.activeDownloads;
 
     if (!downloads.count) {
-        self.tableView.tableHeaderView = nil;
+
+        self.tableView.tableHeaderView =
+            nil;
+
         return;
     }
 
-    CGFloat width =
-        CGRectGetWidth(self.tableView.bounds);
 
-    CGFloat titleHeight = 34.0;
-    CGFloat rowHeight = 74.0;
+    CGFloat width =
+        CGRectGetWidth(
+            self.tableView.bounds);
+
+    CGFloat titleHeight =
+        34.0;
+
+    CGFloat rowHeight =
+        74.0;
 
     CGFloat height =
         titleHeight +
         rowHeight * downloads.count +
         8.0;
 
+
     UIView *header =
         [[UIView alloc]
             initWithFrame:CGRectMake(
-                0, 0, width, height)];
+                0,
+                0,
+                width,
+                height)];
 
     header.backgroundColor =
         [UIColor colorWithRed:0.055
@@ -753,12 +831,18 @@ static void *NFOfflineResumeContext =
                          blue:0.105
                         alpha:1];
 
+
     UILabel *heading =
         [[UILabel alloc]
             initWithFrame:CGRectMake(
-                15, 7, width - 30, 22)];
+                15,
+                7,
+                width - 30,
+                22)];
 
-    heading.text = @"IN DOWNLOAD";
+    heading.text =
+        @"CODA DOWNLOAD";
+
     heading.textColor =
         [UIColor colorWithRed:0.63
                         green:0.69
@@ -778,13 +862,16 @@ static void *NFOfflineResumeContext =
         NSDictionary *download =
             downloads[i];
 
+
         NSString *filename =
             download[@"filename"] ?: @"";
+
 
         NSDictionary *meta =
             [[NSUserDefaults standardUserDefaults]
                 dictionaryForKey:
                     NFOfflineMetaKey(filename)];
+
 
         NSString *title =
             meta[@"title"];
@@ -793,28 +880,41 @@ static void *NFOfflineResumeContext =
                 [NSString class]] ||
             !title.length) {
 
-            title = filename.length
-                ? filename
-                : @"Download";
+            title =
+                filename.length
+                    ? filename
+                    : @"Download";
         }
+
+
+        BOOL queued =
+            [download[@"queued"]
+                boolValue];
+
 
         double fraction =
             [download[@"progress"]
                 doubleValue];
 
         if (!isfinite(fraction) ||
-            fraction < 0.0)
+            fraction < 0.0) {
+
             fraction = 0.0;
+        }
 
         if (fraction > 1.0)
             fraction = 1.0;
 
+
         NSInteger percent =
-            (NSInteger)(fraction * 100.0);
+            (NSInteger)(
+                fraction * 100.0);
+
 
         CGFloat y =
             titleHeight +
             i * rowHeight;
+
 
         UIView *card =
             [[UIView alloc]
@@ -830,43 +930,55 @@ static void *NFOfflineResumeContext =
                              blue:0.185
                             alpha:1];
 
-        card.layer.cornerRadius = 7;
-        card.clipsToBounds = YES;
-
-        [header addSubview:card];
+        card.layer.cornerRadius =
+            7.0;
 
 
-        UILabel *name =
+        UILabel *titleLabel =
             [[UILabel alloc]
                 initWithFrame:CGRectMake(
                     12,
                     7,
-                    card.bounds.size.width - 94,
-                    20)];
+                    card.bounds.size.width - 105,
+                    21)];
 
-        name.text = title;
-        name.textColor = [UIColor whiteColor];
-        name.font =
+        titleLabel.text =
+            title;
+
+        titleLabel.textColor =
+            [UIColor whiteColor];
+
+        titleLabel.font =
             [UIFont boldSystemFontOfSize:13];
 
-        name.adjustsFontSizeToFitWidth = YES;
-        name.minimumScaleFactor = 0.75;
+        titleLabel.lineBreakMode =
+            NSLineBreakByTruncatingTail;
 
-        [card addSubview:name];
+        [card addSubview:titleLabel];
 
 
         UILabel *status =
             [[UILabel alloc]
                 initWithFrame:CGRectMake(
                     12,
-                    28,
-                    card.bounds.size.width - 94,
+                    29,
+                    card.bounds.size.width - 105,
                     17)];
 
-        status.text =
-            [NSString stringWithFormat:
-                @"Download in corso · %ld%%",
-                (long)percent];
+
+        if (queued) {
+
+            status.text =
+                @"In attesa";
+
+        } else {
+
+            status.text =
+                [NSString stringWithFormat:
+                    @"Download in corso · %ld%%",
+                    (long)percent];
+        }
+
 
         status.textColor =
             [UIColor lightGrayColor];
@@ -879,7 +991,8 @@ static void *NFOfflineResumeContext =
 
         UIButton *cancel =
             [UIButton
-                buttonWithType:UIButtonTypeSystem];
+                buttonWithType:
+                    UIButtonTypeSystem];
 
         cancel.frame =
             CGRectMake(
@@ -888,10 +1001,12 @@ static void *NFOfflineResumeContext =
                 67,
                 34);
 
-        cancel.tag = i;
+        cancel.tag =
+            i;
 
         [cancel setTitle:@"Annulla"
-            forState:UIControlStateNormal];
+            forState:
+                UIControlStateNormal];
 
         cancel.titleLabel.font =
             [UIFont systemFontOfSize:11];
@@ -901,18 +1016,27 @@ static void *NFOfflineResumeContext =
                             green:0.78
                              blue:0.85
                             alpha:1]
-            forState:UIControlStateNormal];
+            forState:
+                UIControlStateNormal];
 
         [cancel addTarget:self
-            action:@selector(cancelActiveDownload:)
+            action:
+                @selector(
+                    cancelActiveDownload:)
             forControlEvents:
                 UIControlEventTouchUpInside];
 
         [card addSubview:cancel];
 
 
+        /*
+         * Barra:
+         * - attivo  -> avanzamento reale
+         * - queued  -> vuota
+         */
         CGFloat barWidth =
             card.bounds.size.width - 24;
+
 
         UIView *track =
             [[UIView alloc]
@@ -926,7 +1050,14 @@ static void *NFOfflineResumeContext =
             [UIColor colorWithWhite:1
                               alpha:0.12];
 
-        track.clipsToBounds = YES;
+        track.clipsToBounds =
+            YES;
+
+
+        CGFloat fillWidth =
+            queued
+                ? 0.0
+                : barWidth * fraction;
 
 
         UIView *fill =
@@ -934,7 +1065,7 @@ static void *NFOfflineResumeContext =
                 initWithFrame:CGRectMake(
                     0,
                     0,
-                    barWidth * fraction,
+                    fillWidth,
                     3)];
 
         fill.backgroundColor =
@@ -944,10 +1075,15 @@ static void *NFOfflineResumeContext =
                             alpha:1];
 
         [track addSubview:fill];
+
         [card addSubview:track];
+
+        [header addSubview:card];
     }
 
-    self.tableView.tableHeaderView = header;
+
+    self.tableView.tableHeaderView =
+        header;
 }
 
 

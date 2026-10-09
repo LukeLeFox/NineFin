@@ -13,13 +13,13 @@ Prebuilt IPA files are provided in the GitHub Releases section, so you do **not*
 
 Current public release:
 
-- NineFin 0.7.3
+- NineFin 0.7.4
 - Bundle ID: `dev.luke.ninefin`
 - iOS 9.0+
 - ARMv7
 - Prebuilt IPA included in the release assets
 
-NineFin 0.7.3 is the current offline playback and synchronization release. Its prebuilt IPA is available from the latest GitHub Release.
+NineFin 0.7.4 is the current stable offline playback release. It adds a persistent serial download queue, background transfers, whole-season downloads, and one completion summary per season. Its prebuilt IPA is available from the latest GitHub Release.
 
 > On legacy iOS 9 hardware, installation requires a compatible IPA sideload method. A jailbroken device with AppSync Unified is the recommended setup used during NineFin testing.
 
@@ -44,14 +44,27 @@ The screenshots use documentation-only network addresses and contain no private 
 - Correct playback-completion reporting and watched-state handling
 - Downloads for offline playback, managed directly from an item's detail screen
 - A dedicated Downloads library with active-transfer progress and local storage controls
+- A persistent FIFO download queue with one active transfer at a time
+- Background downloads that continue while NineFin is suspended and are restored after relaunch
+- Whole-season downloads with a single completion summary instead of one notification per episode
 - Offline resume and watched-state tracking, queued safely while the server is unavailable
 - Explicit online synchronization with conflict handling for server progress and completed items
 - Audio-track and subtitle selection
 - iPhone and iPad icon assets for iOS 9
 
+## What's new in 0.7.4
+
+NineFin 0.7.4 makes larger offline downloads more reliable on iOS 9:
+
+- Movies, episodes, and season batches enter a serial FIFO queue, with queued and active items shown separately in the Downloads screen
+- Transfers use an iOS background session so they can continue while NineFin is suspended and can be restored after a relaunch
+- Pending jobs are persisted without authentication tokens; NineFin rebuilds authenticated requests from the matching Keychain session
+- A season download produces one final local notification summarizing completed and failed episodes
+- Queue progress, cancellation, completion, and already-downloaded-file reconciliation remain consistent across foreground and background transitions
+
 ## Offline playback and synchronization
 
-NineFin 0.7.3 adds a complete offline workflow for legacy devices:
+NineFin 0.7.4 includes a complete offline workflow for legacy devices:
 
 - Download a movie or episode over an authenticated Jellyfin session
 - Play downloaded media without a network connection
