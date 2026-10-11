@@ -39,6 +39,19 @@ static NSUInteger NFImageCost(UIImage *image) {
                         image.size.height * image.scale * 4);
 }
 
+/*
+ * Scelta sottotitoli quando l'utente non ne indica una per il
+ * singolo item: -1 = disattivati (default), nil = decide Jellyfin.
+ * Una traccia specifica non si ricorda: gli indici cambiano tra file.
+ */
+static NSString * const NFSubtitleModeKey = @"NineFin.SubtitleMode";
+
+static NSNumber *NFDefaultSubtitleChoice(void) {
+    NSInteger mode = [[NSUserDefaults standardUserDefaults]
+        integerForKey:NFSubtitleModeKey];
+    return mode == -2 ? nil : @(-1);
+}
+
 static NSInteger NFStreamingBitrate(void) {
     NSInteger b = [[NSUserDefaults standardUserDefaults]
         integerForKey:@"NineFin.StreamingBitrate"];
@@ -2108,6 +2121,9 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
          sourceId:(NSString *)sourceId {
     NSString *itemId = item[@"Id"];
 
+    if (!subtitle)
+        subtitle = NFDefaultSubtitleChoice();
+
     NSDictionary *profile = @{
         @"Name": @"NineFin iOS 9",
         @"DirectPlayProfiles": @[],
@@ -2198,14 +2214,16 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
         if (audio)
             body[@"AudioStreamIndex"] = audio;
 
-        if (subtitle) {
+        if (subtitle && subtitle.integerValue >= 0) {
             body[@"SubtitleStreamIndex"] = subtitle;
-
-            if (subtitle.integerValue >= 0)
-                body[@"AlwaysBurnInSubtitleWhenTranscoding"] =
-                    @YES;
+            body[@"AlwaysBurnInSubtitleWhenTranscoding"] = @YES;
         }
     }
+
+    // "Disattivati" vale anche senza media source scelta
+    // (riproduzione diretta da Home o dalla lista episodi).
+    if (subtitle.integerValue == -1)
+        body[@"SubtitleStreamIndex"] = @(-1);
 
     NSString *path = [NSString stringWithFormat:
         @"/Items/%@/PlaybackInfo?UserId=%@",
@@ -2358,7 +2376,9 @@ static void *NFResumeContext = &NFResumeContext;
                 : @"Transcode";
 
         body[@"CanSeek"] = @YES;
-        body[@"IsPaused"] = @(self.player.rate == 0);
+        // Booleano JSON vero: @(a == b) produce 1/0 e Jellyfin 12
+        // rifiuta l'intero report con HTTP 400.
+        body[@"IsPaused"] = self.player.rate == 0 ? @YES : @NO;
         body[@"IsMuted"] = @NO;
     }
 
@@ -5027,6 +5047,9 @@ NFEnqueueOriginalDownloadForItem(
 
 - (NSString *)nfSelectionLabel:(NSNumber *)index
                           type:(NSString *)type {
+    if (!index && [type isEqualToString:@"Subtitle"])
+        index = NFDefaultSubtitleChoice();
+
     if (!index)
         return @"Automatica";
 
@@ -5083,7 +5106,9 @@ NFEnqueueOriginalDownloadForItem(
     picker.title = sub ? @"Sottotitoli" : @"Audio";
     picker.entries = entries;
     picker.current =
-        (sub ? self.nfSubtitle : self.nfAudio) ?: @(-2);
+        (sub ? (self.nfSubtitle ?: NFDefaultSubtitleChoice())
+             : self.nfAudio) ?: @(-2);
+
 
     __weak NFDetailsController *weakSelf = self;
 
@@ -5094,10 +5119,20 @@ NFEnqueueOriginalDownloadForItem(
         NSNumber *chosen =
             number.integerValue == -2 ? nil : number;
 
-        if (sub)
+        if (sub) {
             vc.nfSubtitle = chosen;
-        else
+
+            // Disattivati/Automatica diventano il default
+            // per i prossimi episodi.
+            if (!chosen || chosen.integerValue == -1) {
+                [[NSUserDefaults standardUserDefaults]
+                    setInteger:chosen ? -1 : -2
+                    forKey:NFSubtitleModeKey];
+            }
+        } else {
             vc.nfAudio = chosen;
+        }
+
 
         [vc renderHeader];
     };
