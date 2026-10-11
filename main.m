@@ -2368,8 +2368,12 @@ static void *NFResumeContext = &NFResumeContext;
     NFRequest(endpoint, @"POST", body,
         ^(id result, NSError *error) {
             if (error) {
-                NSLog(@"NineFin playback report failed: %@ (%ld)",
-                    endpoint, (long)error.code);
+                // localizedDescription contiene la risposta del
+                // server con il token già oscurato da NFRequest.
+                NSLog(@"NineFin playback report failed: %@ (%ld) %@",
+                    endpoint, (long)error.code,
+                    error.localizedDescription);
+
 
                 if (localFileURL)
                     [NFDownloadsController
