@@ -2294,7 +2294,32 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
             components.queryItems = queries;
         }
 
+        /*
+         * Senza MediaSourceId Jellyfin ignora SubtitleStreamIndex=-1
+         * e incide il sottotitolo predefinito (es. da "Continua a
+         * guardare"): lo togliamo direttamente dall'URL HLS.
+         */
+        if (subtitle.integerValue == -1) {
+            NSMutableArray *queries = [NSMutableArray array];
+
+            for (NSURLQueryItem *q in components.queryItems) {
+                NSString *name = q.name.lowercaseString;
+                if ([name isEqualToString:@"subtitlestreamindex"] ||
+                    [name isEqualToString:@"subtitlemethod"] ||
+                    [name isEqualToString:@"subtitlecodec"])
+                    continue;
+                [queries addObject:q];
+            }
+
+            [queries addObject:
+                [NSURLQueryItem queryItemWithName:@"SubtitleStreamIndex"
+                    value:@"-1"]];
+
+            components.queryItems = queries;
+        }
+
         NFTrackedPlayerController *playerVC =
+
             [[NFTrackedPlayerController alloc] init];
 
         playerVC.playMethod = @"Transcode";
