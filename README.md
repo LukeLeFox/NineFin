@@ -13,13 +13,13 @@ Prebuilt IPA files are provided in the GitHub Releases section, so you do **not*
 
 Current public release:
 
-- NineFin 0.7.4
+- NineFin 0.7.5
 - Bundle ID: `dev.luke.ninefin`
 - iOS 9.0+
 - ARMv7
 - Prebuilt IPA included in the release assets
 
-NineFin 0.7.4 is the current stable offline playback release. It adds a persistent serial download queue, background transfers, whole-season downloads, and one completion summary per season. Its prebuilt IPA is available from the latest GitHub Release.
+NineFin 0.7.5 is the current stable release. It fixes playback reporting on recent Jellyfin servers, makes background downloads survive network errors and force-quits, and keeps offline progress safe. Its prebuilt IPA is available from the latest GitHub Release.
 
 > On legacy iOS 9 hardware, installation requires a compatible IPA sideload method. A jailbroken device with AppSync Unified is the recommended setup used during NineFin testing.
 
@@ -51,6 +51,22 @@ The screenshots use documentation-only network addresses and contain no private 
 - Explicit online synchronization with conflict handling for server progress and completed items
 - Audio-track and subtitle selection
 - iPhone and iPad icon assets for iOS 9
+
+## What's new in 0.7.5
+
+NineFin 0.7.5 is a reliability release:
+
+- Playback start and progress are reported correctly again on recent Jellyfin servers (`IsPaused` is now sent as a JSON boolean), so Continue Watching follows what you watch in NineFin
+- Downloads interrupted by network errors or by force-quitting the app are recreated in the same queue position and resume from where they stopped when iOS provides resume data
+- Downloaded media is excluded from iCloud/iTunes backups, and new downloads are refused when less than 500 MB of storage is free
+- Deleting or re-downloading a file no longer discards offline progress that has not been synchronized yet
+- "Go online and sync" can no longer get stuck, and playing a download from an item's detail screen while offline now records progress for later sync
+- Video plays with sound even when the silent switch is on
+- Libraries load 100 items at a time instead of stopping at 200
+- Subtitles are off by default; choosing Off or Automatic is remembered for the next episodes
+- Logging out from the app also forgets the saved password for that server
+- Home refreshes only when its content changes, posters use a bounded memory cache, and the transcoding profile respects the H.264 limits of A5/A6 devices
+- Launch images for full-screen display on 4-inch and larger iPhones
 
 ## What's new in 0.7.4
 
@@ -119,9 +135,7 @@ NineFin permits arbitrary network loads so it can connect to legacy and local Je
 
 ## Project website
 
-A lightweight project page is included under `docs/` and can be published with GitHub Pages.
-
-Expected GitHub Pages URL:
+The project page is part of the LukeLeFox site:
 
 https://lukelefox.github.io/NineFin/
 
