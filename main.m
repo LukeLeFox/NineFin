@@ -4982,12 +4982,47 @@ NFEnqueueOriginalDownloadForItem(
 
         if (error) {
             NSLog(@"NineFin tracks: %@", error);
+            [vc nfLoadTracksFromItem:itemId server:server user:user];
             return;
         }
 
         [vc nfApplySources:result[@"MediaSources"]];
     });
 }
+
+/*
+ * Ripiego se PlaybackInfo fallisce sul server: le stesse media
+ * source arrivano anche dall'item con Fields=MediaSources.
+ */
+- (void)nfLoadTracksFromItem:(NSString *)itemId
+                      server:(NSString *)server
+                        user:(NSString *)user {
+    NSString *path = [NSString stringWithFormat:
+        @"/Users/%@/Items/%@?Fields=MediaSources,MediaStreams",
+        user, itemId];
+
+    __weak NFDetailsController *weakSelf = self;
+
+    NFRequest(path, @"GET", nil,
+        ^(id result, NSError *error) {
+
+        NFDetailsController *vc = weakSelf;
+
+        if (!vc ||
+            ![NFServer isEqualToString:server] ||
+            ![NFUser isEqualToString:user])
+            return;
+
+        if (error || ![result isKindOfClass:[NSDictionary class]]) {
+            NSLog(@"NineFin tracks fallback: %@", error);
+            return;
+        }
+
+        NSLog(@"NineFin tracks: loaded from item fallback");
+        [vc nfApplySources:result[@"MediaSources"]];
+    });
+}
+
 
 - (void)nfApplySources:(NSArray *)sources {
     if (![sources isKindOfClass:[NSArray class]])
