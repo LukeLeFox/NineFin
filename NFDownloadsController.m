@@ -75,6 +75,10 @@ NFDownloadsRowHeight(CGFloat width) {
 static void *NFOfflineResumeContext =
     &NFOfflineResumeContext;
 
+static void NFRecordOfflinePosition(NSString *filename,
+                                    double seconds);
+
+
 
 @interface NFOfflinePlayerController : AVPlayerViewController
 
@@ -106,31 +110,40 @@ static void *NFOfflineResumeContext =
         seconds < 1.0)
         return;
 
-    NSUserDefaults *defaults =
-        [NSUserDefaults standardUserDefaults];
-
-    /*
-     * Resume locale immediato.
-     */
-    [defaults setDouble:seconds
-        forKey:self.resumeKey];
-
-
-    /*
-     * Coda di sincronizzazione Jellyfin.
-     *
-     * Il filename è già univoco per server + item.
-     */
     NSString *prefix =
         @"NineFin.OfflineResume.";
 
     if ([self.resumeKey hasPrefix:prefix]) {
+        NFRecordOfflinePosition(
+            [self.resumeKey substringFromIndex:prefix.length],
+            seconds);
+    } else {
+        NSUserDefaults *defaults =
+            [NSUserDefaults standardUserDefaults];
+        [defaults setDouble:seconds forKey:self.resumeKey];
+        [defaults synchronize];
+    }
+}
 
-        NSString *filename =
-            [self.resumeKey
-                substringFromIndex:
-                    prefix.length];
 
+/*
+ * Resume locale immediato + record pending per la coda di
+ * sincronizzazione Jellyfin. Il filename è già univoco per
+ * server + item.
+ */
+static void NFRecordOfflinePosition(NSString *filename,
+                                    double seconds) {
+    if (!filename.length || !isfinite(seconds) || seconds < 1.0)
+        return;
+
+    NSUserDefaults *defaults =
+        [NSUserDefaults standardUserDefaults];
+
+    [defaults setDouble:seconds
+        forKey:[@"NineFin.OfflineResume."
+            stringByAppendingString:filename]];
+
+    {
         NSString *metaKey =
             NFOfflineMetaKey(filename);
 
@@ -465,6 +478,27 @@ static void *NFOfflineResumeContext =
 @end
 
 @implementation NFDownloadsController
+
++ (UIViewController *)offlinePlayerForFileURL:(NSURL *)url {
+    NFOfflinePlayerController *vc =
+        [[NFOfflinePlayerController alloc] init];
+
+    vc.player =
+        [AVPlayer playerWithURL:url];
+
+    vc.resumeKey =
+        [@"NineFin.OfflineResume."
+            stringByAppendingString:
+                url.lastPathComponent];
+
+    return vc;
+}
+
++ (void)recordOfflinePosition:(double)seconds
+                  forFileURL:(NSURL *)url {
+    NFRecordOfflinePosition(url.lastPathComponent, seconds);
+}
+
 
 - (void)viewDidLoad {
     [super viewDidLoad];
@@ -1770,18 +1804,11 @@ static void *NFOfflineResumeContext =
 
     NSLog(@"NineFin local-only playback: %@", url.path);
 
-    NFOfflinePlayerController *vc =
-        [[NFOfflinePlayerController alloc] init];
-
-    vc.player =
-        [AVPlayer playerWithURL:url];
-
-    vc.resumeKey =
-        [@"NineFin.OfflineResume."
-            stringByAppendingString:
-                url.lastPathComponent];
+    UIViewController *vc =
+        [NFDownloadsController offlinePlayerForFileURL:url];
 
     [self presentViewController:vc
+
         animated:YES
         completion:nil];
 }

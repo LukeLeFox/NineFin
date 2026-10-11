@@ -311,6 +311,13 @@ static void NFRestore(void) {
             NFUser = old[@"user"];
             NFSave();
         }
+
+        // Il vecchio item 0.3 non serve più dopo la migrazione.
+        if (NFServerList().count)
+            SecItemDelete((__bridge CFDictionaryRef)
+                NFKeychainQueryForAccount(@"jellyfin"));
+
+
     }
 
     NSArray *servers = NFServerList();
@@ -336,6 +343,21 @@ static void NFLogout(void) {
     NFUser = nil;
 }
 
+/*
+ * Disconnessione esplicita dell'utente: oltre alla sessione
+ * rimuove anche utente e password salvati per quel server.
+ * I 401 automatici usano NFLogout() e mantengono il precompilato.
+ */
+static void NFLogoutForgettingCredentials(void) {
+    if (NFServer.length) {
+        NSDictionary *query = NFKeychainQueryForAccount(
+            NFCredentialsAccount(NFServer));
+        SecItemDelete((__bridge CFDictionaryRef)query);
+    }
+
+    NFLogout();
+}
+
 static NSURL *NFURL(NSString *path) {
     if ([path hasPrefix:@"media:"])
         path = [path substringFromIndex:6];
@@ -355,19 +377,34 @@ static NSURL *NFURL(NSString *path) {
         [base stringByAppendingString:path]];
 }
 
+/*
+ * Header MediaBrowser unico per richieste normali e job persistiti.
+ * Versione letta dal bundle, nome dispositivo dal modello reale.
+ */
+static NSString *NFAuthorizationValue(NSString *token) {
+    static NSString *prefix = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *version = [[NSBundle mainBundle]
+            objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+        UIDevice *device = [UIDevice currentDevice];
+        NSString *name = [NSString stringWithFormat:@"%@ iOS %@",
+            device.model ?: @"iOS", device.systemVersion ?: @"9"];
+        name = [name stringByReplacingOccurrencesOfString:@"\""
+            withString:@""];
+        prefix = [NSString stringWithFormat:
+            @"MediaBrowser Client=\"NineFin\", "
+             "Device=\"%@\", DeviceId=\"%@\", Version=\"%@\"",
+            name, NFDevice(), version.length ? version : @"0"];
+    });
+
+    if (!token.length) return prefix;
+    return [prefix stringByAppendingFormat:@", Token=\"%@\"", token];
+}
+
 static void NFHeaders(NSMutableURLRequest *r) {
-    NSMutableString *auth = [NSMutableString
-        stringWithFormat:
-        @"MediaBrowser Client=\"NineFin\", "
-         "Device=\"iPhone iOS9\", "
-         "DeviceId=\"%@\", Version=\"0.7.4\"",
-        NFDevice()];
-
-    if (NFToken.length) {
-        [auth appendFormat:@", Token=\"%@\"", NFToken];
-    }
-
-    [r setValue:auth forHTTPHeaderField:@"Authorization"];
+    [r setValue:NFAuthorizationValue(NFToken)
+        forHTTPHeaderField:@"Authorization"];
     [r setValue:@"application/json"
         forHTTPHeaderField:@"Accept"];
 }
@@ -519,14 +556,7 @@ NFRequestForPersistedDownloadJob(
      * Stesso formato MediaBrowser utilizzato
      * dalle richieste normali di NineFin.
      */
-    NSString *authorization =
-        [NSString stringWithFormat:
-            @"MediaBrowser Client=\"NineFin\", "
-             "Device=\"iPhone iOS9\", "
-             "DeviceId=\"%@\", Version=\"0.7.4\", "
-             "Token=\"%@\"",
-            NFDevice(),
-            token];
+    NSString *authorization = NFAuthorizationValue(token);
 
     NSMutableURLRequest *request =
         [NSMutableURLRequest requestWithURL:url];
@@ -556,6 +586,12 @@ NFRequestForPersistedDownloadJob(
 
 static void NFRequest(NSString *path, NSString *method,
                       NSDictionary *body, NFResult completion) {
+    /*
+     * Copia locale: un 401 concorrente può azzerare NFToken
+     * sul main thread mentre questa callback gira in background.
+     */
+    NSString *requestToken = [NFToken copy];
+
     NSMutableURLRequest *r =
         [NSMutableURLRequest requestWithURL:NFURL(path)];
 
@@ -590,9 +626,9 @@ static void NFRequest(NSString *path, NSString *method,
 
             if (!details) details = @"";
 
-            if (NFToken.length) {
+            if (requestToken.length) {
                 details = [details
-                    stringByReplacingOccurrencesOfString:NFToken
+                    stringByReplacingOccurrencesOfString:requestToken
                     withString:@"[REDACTED]"];
             }
 
@@ -1103,6 +1139,12 @@ NFOfflineSyncOne(
 
 static BOOL NFOfflineSyncRunning = NO;
 
+/*
+ * Completion di chi ha chiesto una sync mentre un'altra era
+ * già in corso: vengono chiamate con il risultato di quella.
+ */
+static NSMutableArray *NFOfflineSyncWaiters = nil;
+
 
 static void NFOfflineSyncNext(
     NSArray *entries,
@@ -1143,6 +1185,14 @@ static void NFOfflineSyncNext(
                 synced,
                 resolved,
                 pending);
+        }
+
+        NSArray *waiters = [NFOfflineSyncWaiters copy];
+        [NFOfflineSyncWaiters removeAllObjects];
+
+        for (void (^waiter)(NSInteger, NSInteger, NSInteger)
+                in waiters) {
+            waiter(synced, resolved, pending);
         }
 
         return;
@@ -1203,6 +1253,12 @@ NFRunOfflineSyncQueue(
             @"NineFin offline sync: "
              @"already running");
 
+        if (completion) {
+            if (!NFOfflineSyncWaiters)
+                NFOfflineSyncWaiters = [NSMutableArray array];
+            [NFOfflineSyncWaiters addObject:[completion copy]];
+        }
+
         return;
     }
 
@@ -1215,8 +1271,19 @@ NFRunOfflineSyncQueue(
             @"NineFin offline sync: "
              @"no active authenticated session");
 
+        /*
+         * Senza sessione non c'è nulla da sincronizzare adesso:
+         * si chiude come "riconciliato" così Scaricati porta al
+         * login. I record restano pending e vengono inviati dalla
+         * sync automatica della Home dopo l'accesso.
+         */
+        if (completion) {
+            completion(0, 0, 0);
+        }
+
         return;
     }
+
 
 
     NSArray *entries =
@@ -1402,6 +1469,9 @@ typedef void (^NFBackgroundSessionCompletion)();
 @property (assign, nonatomic) BOOL didStop;
 @property (assign, nonatomic) BOOL observingPlaybackEnd;
 @property (copy, nonatomic) NSString *playMethod;
+// File locale riprodotto: se il server non risponde la posizione
+// finisce nella coda di sync offline invece di andare persa.
+@property (copy, nonatomic) NSURL *localFileURL;
 
 - (void)stopResumeObservation;
 - (void)stopPlaybackEndObservation;
@@ -1411,6 +1481,10 @@ typedef void (^NFBackgroundSessionCompletion)();
 @interface NFLibraryController : UITableViewController
 @property (copy, nonatomic) NSString *parentId;
 @property (strong, nonatomic) NSArray *items;
+// Paginazione della cartella: 0 = nessuna pagina successiva nota.
+@property (assign, nonatomic) NSInteger pagedTotal;
+@property (assign, nonatomic) BOOL loadingPage;
+@property (assign, nonatomic) NSUInteger pageGeneration;
 - (instancetype)initWithParent:(NSString *)parent title:(NSString *)title;
 - (void)reloadItems;
 - (void)playItem:(NSDictionary *)item;
@@ -1762,12 +1836,29 @@ typedef void (^NFBackgroundSessionCompletion)();
 - (void)logout {
     NFRequest(@"/Sessions/Logout", @"POST",
               nil, ^(id result, NSError *error) {});
-    NFLogout();
+    NFLogoutForgettingCredentials();
     [(NFAppDelegate *)[UIApplication sharedApplication].delegate
         showLogin];
 }
 
+static const NSInteger NFLibraryPageSize = 100;
+
 - (void)reloadItems {
+    self.pageGeneration++;
+    self.pagedTotal = 0;
+    self.loadingPage = NO;
+    [self loadItemsFromIndex:0];
+}
+
+- (void)loadMoreItemsIfNeeded:(NSInteger)row {
+    if (!self.parentId || self.loadingPage) return;
+    if ((NSInteger)self.items.count >= self.pagedTotal) return;
+    if (row < (NSInteger)self.items.count - 20) return;
+
+    [self loadItemsFromIndex:self.items.count];
+}
+
+- (void)loadItemsFromIndex:(NSUInteger)startIndex {
     NSString *path;
 
     if (!self.parentId) {
@@ -1776,13 +1867,21 @@ typedef void (^NFBackgroundSessionCompletion)();
     } else {
         path = [NSString stringWithFormat:
             @"/Users/%@/Items?ParentId=%@"
-             "&SortBy=SortName&Limit=200"
+             "&SortBy=SortName&StartIndex=%lu&Limit=%ld"
              "&Fields=Overview,UserData",
-            NFUser, self.parentId];
+            NFUser, self.parentId,
+            (unsigned long)startIndex, (long)NFLibraryPageSize];
     }
+
+    NSUInteger generation = self.pageGeneration;
+    self.loadingPage = YES;
 
     NFRequest(path, @"GET", nil,
               ^(id result, NSError *error) {
+
+        // Risposta di un caricamento superato da un refresh.
+        if (generation != self.pageGeneration) return;
+        self.loadingPage = NO;
 
         if (error) {
             if (error.code == 401) {
@@ -1798,12 +1897,30 @@ typedef void (^NFBackgroundSessionCompletion)();
         }
 
         NSArray *received = result[@"Items"];
-        self.items = [received isKindOfClass:[NSArray class]]
-            ? received : @[];
+        if (![received isKindOfClass:[NSArray class]])
+            received = @[];
+
+        self.items = startIndex > 0
+            ? [self.items arrayByAddingObjectsFromArray:received]
+            : received;
+
+        NSNumber *total = result[@"TotalRecordCount"];
+        self.pagedTotal =
+            (self.parentId &&
+             [total isKindOfClass:[NSNumber class]] &&
+             received.count > 0)
+            ? total.integerValue : 0;
 
         [self.tableView reloadData];
     });
 }
+
+- (void)tableView:(UITableView *)tableView
+  willDisplayCell:(UITableViewCell *)cell
+forRowAtIndexPath:(NSIndexPath *)indexPath {
+    [self loadMoreItemsIfNeeded:indexPath.row];
+}
+
 
 - (NSInteger)tableView:(UITableView *)tableView
  numberOfRowsInSection:(NSInteger)section {
@@ -1984,9 +2101,16 @@ typedef void (^NFBackgroundSessionCompletion)();
         effectiveProfile[@"SubtitleProfiles"] = profiles;
     }
 
+    if (!NFUser.length) {
+        [(NFAppDelegate *)[UIApplication sharedApplication].delegate
+            showLogin];
+        return;
+    }
+
     NSMutableDictionary *body = [@{
         @"DeviceProfile": effectiveProfile,
         @"UserId": NFUser,
+
         @"EnableDirectPlay": @NO,
         @"EnableDirectStream": @NO,
         @"EnableTranscoding": @YES,
@@ -2165,11 +2289,19 @@ static void *NFResumeContext = &NFResumeContext;
         body[@"IsMuted"] = @NO;
     }
 
+    NSURL *localFileURL = self.localFileURL;
+    double seconds = CMTimeGetSeconds(self.player.currentTime);
+
     NFRequest(endpoint, @"POST", body,
         ^(id result, NSError *error) {
             if (error) {
                 NSLog(@"NineFin playback report failed: %@ (%ld)",
                     endpoint, (long)error.code);
+
+                if (localFileURL)
+                    [NFDownloadsController
+                        recordOfflinePosition:seconds
+                        forFileURL:localFileURL];
             }
 
             if (completion)
@@ -2321,11 +2453,26 @@ static void *NFResumeContext = &NFResumeContext;
                 NFTrackedPlayerController *strongSelf = weakSelf;
                 if (!strongSelf || strongSelf.didStop) return;
 
-                if (strongSelf.player.rate > 0) {
-                    [strongSelf
-                        report:@"/Sessions/Playing/Progress"];
-                }
+                // Anche in pausa: IsPaused=YES tiene viva la
+                // sessione lato Jellyfin.
+                [strongSelf
+                    report:@"/Sessions/Playing/Progress"];
             }];
+
+    [[NSNotificationCenter defaultCenter]
+        addObserver:self
+        selector:@selector(nfDidEnterBackground:)
+        name:UIApplicationDidEnterBackgroundNotification
+        object:nil];
+}
+
+/*
+ * In background iOS mette in pausa il video: aggiorniamo subito
+ * posizione e stato, nel caso l'app venga poi terminata.
+ */
+- (void)nfDidEnterBackground:(NSNotification *)note {
+    if (!self.didStart || self.didStop) return;
+    [self report:@"/Sessions/Playing/Progress"];
 }
 
 
@@ -2396,6 +2543,11 @@ static void *NFResumeContext = &NFResumeContext;
     if (!self.didStart || self.didStop) return;
     self.didStop = YES;
 
+    [[NSNotificationCenter defaultCenter]
+        removeObserver:self
+        name:UIApplicationDidEnterBackgroundNotification
+        object:nil];
+
     if (self.progressObserver) {
         [self.player
             removeTimeObserver:self.progressObserver];
@@ -2407,6 +2559,7 @@ static void *NFResumeContext = &NFResumeContext;
 }
 
 - (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
     [self stopResumeObservation];
     [self stopPlaybackEndObservation];
 
@@ -4615,7 +4768,7 @@ NFEnqueueOriginalDownloadForItem(
             NFRequest(@"/Sessions/Logout", @"POST",
                 nil, ^(id result, NSError *error) {});
 
-            NFLogout();
+            NFLogoutForgettingCredentials();
 
             [(NFAppDelegate *)
                 [UIApplication sharedApplication].delegate
@@ -5818,6 +5971,25 @@ NFEnqueueOriginalDownloadForItem(
                 NSLog(@"NineFin offline playback: %@",
                     localURL.path);
 
+                /*
+                 * Senza rete il player tracciato perderebbe ogni
+                 * report: usiamo quello di Scaricati, che salva
+                 * resume locale e coda di sync.
+                 */
+                if (!NFNetworkRouteAvailable() || !NFToken.length) {
+                    UIViewController *presenter =
+                        self.navigationController
+                            .topViewController ?: self;
+
+                    [presenter
+                        presentViewController:
+                            [NFDownloadsController
+                                offlinePlayerForFileURL:localURL]
+                        animated:YES
+                        completion:nil];
+                    return;
+                }
+
                 NFTrackedPlayerController *playerVC =
                     [[NFTrackedPlayerController alloc]
                         init];
@@ -5859,9 +6031,12 @@ NFEnqueueOriginalDownloadForItem(
                 playerVC.resumeTicks =
                     resumeTicks;
 
+                playerVC.localFileURL = localURL;
+
                 playerVC.player =
                     [AVPlayer
                         playerWithURL:localURL];
+
 
                 UIViewController *presenter =
                     self.navigationController
@@ -6806,7 +6981,19 @@ NFEnqueueOriginalDownloadForItem(
  didFinishLaunchingWithOptions:(NSDictionary *)options {
 
     /*
+     * Categoria Playback: senza, iOS usa SoloAmbient e i video
+     * restano muti con l'interruttore silenzioso attivo.
+     */
+    NSError *audioError = nil;
+    if (![[AVAudioSession sharedInstance]
+            setCategory:AVAudioSessionCategoryPlayback
+            error:&audioError]) {
+        NSLog(@"NineFin audio session: %@", audioError);
+    }
+
+    /*
      * Va registrato prima che NFDownloadManager venga
+
      * istanziato: durante un relaunch background iOS può
      * avere già eventi pronti da consegnare.
      */
