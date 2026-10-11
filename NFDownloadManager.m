@@ -52,6 +52,9 @@ static NSString * const NFSeasonNotificationOutboxDefaultsKey =
  */
 @property (assign, nonatomic) NSInteger queueSequence;
 
+/* Tentativi automatici dopo errori di rete transitori. */
+@property (assign, nonatomic) NSInteger retryCount;
+
 @end
 
 @implementation NFDownloadContext
@@ -143,6 +146,13 @@ static NSString * const NFSeasonNotificationOutboxDefaultsKey =
 @property (assign, nonatomic)
     BOOL backgroundWakeInProgress;
 
+/*
+ * Copia dello stato UIApplication leggibile dalla delegate
+ * queue: UIKit va interrogato solo dal main thread.
+ */
+@property (atomic, assign)
+    BOOL appInBackground;
+
 @property (assign, nonatomic)
     BOOL advanceQueueAfterBackgroundEvents;
 
@@ -190,6 +200,22 @@ static NSString * const NFSeasonNotificationOutboxDefaultsKey =
         _backgroundStartupMayRegisterLateHandler =
             [UIApplication sharedApplication].applicationState ==
                 UIApplicationStateBackground;
+
+        _appInBackground =
+            _backgroundStartupMayRegisterLateHandler;
+
+        NSNotificationCenter *center =
+            [NSNotificationCenter defaultCenter];
+
+        [center addObserver:self
+            selector:@selector(nfAppStateChanged:)
+            name:UIApplicationDidEnterBackgroundNotification
+            object:nil];
+
+        [center addObserver:self
+            selector:@selector(nfAppStateChanged:)
+            name:UIApplicationWillEnterForegroundNotification
+            object:nil];
 
         /*
          * Sessione persistente gestita da iOS.
@@ -262,6 +288,13 @@ static NSString * const NFSeasonNotificationOutboxDefaultsKey =
 
 
 
+
+
+- (void)nfAppStateChanged:(NSNotification *)note {
+    self.appInBackground =
+        [note.name isEqualToString:
+            UIApplicationDidEnterBackgroundNotification];
+}
 
 
 #pragma mark - Persistent request bridge
@@ -2034,8 +2067,10 @@ static NSString * const NFSeasonNotificationOutboxDefaultsKey =
         fileExistsAtPath:directory.path
         isDirectory:&isDirectory];
 
-    if (exists && isDirectory)
+    if (exists && isDirectory) {
+        [self excludeFromBackup:directory];
         return YES;
+    }
 
     if (exists) {
         [[NSFileManager defaultManager]
@@ -2054,9 +2089,50 @@ static NSString * const NFSeasonNotificationOutboxDefaultsKey =
     if (!result) {
         NSLog(@"NineFin download directory error: %@",
               error);
+    } else {
+        [self excludeFromBackup:directory];
     }
 
     return result;
+}
+
+/*
+ * I video scaricati si possono sempre riscaricare: niente
+ * backup iCloud/iTunes. Il flag sulla cartella vale per
+ * tutto il suo contenuto.
+ */
+- (void)excludeFromBackup:(NSURL *)directory {
+    NSNumber *excluded = nil;
+    [directory getResourceValue:&excluded
+        forKey:NSURLIsExcludedFromBackupKey error:NULL];
+
+    if (excluded.boolValue) return;
+
+    NSError *error = nil;
+    if (![directory setResourceValue:@YES
+            forKey:NSURLIsExcludedFromBackupKey error:&error]) {
+        NSLog(@"NineFin backup exclusion failed: %@", error);
+    }
+}
+
+/*
+ * Spazio minimo libero per accodare un nuovo download.
+ * Jellyfin non sempre comunica la dimensione del file, quindi
+ * usiamo una soglia fissa per non riempire il disco.
+ */
+static const unsigned long long NFMinimumFreeBytes =
+    500ULL * 1024ULL * 1024ULL;
+
+- (BOOL)hasEnoughFreeSpace {
+    NSDictionary *attributes = [[NSFileManager defaultManager]
+        attributesOfFileSystemForPath:NSHomeDirectory()
+        error:NULL];
+    NSNumber *free = attributes[NSFileSystemFreeSize];
+
+    // Se iOS non risponde non blocchiamo il download.
+    if (!free) return YES;
+
+    return free.unsignedLongLongValue >= NFMinimumFreeBytes;
 }
 
 - (NSString *)safeExtension:(NSString *)fileExtension {
@@ -2383,6 +2459,27 @@ static NSString * const NFSeasonNotificationOutboxDefaultsKey =
         return nil;
     }
 
+    if (![self hasEnoughFreeSpace]) {
+        NSLog(@"NineFin download refused: low disk space");
+
+        if (completion) {
+            NSError *error = [NSError
+                errorWithDomain:NFDownloadErrorDomain
+                code:7
+                userInfo:@{
+                    NSLocalizedDescriptionKey:
+                        @"Spazio libero insufficiente: servono "
+                         "almeno 500 MB."
+                }];
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(nil, error);
+            });
+        }
+
+        return nil;
+    }
+
     NSURLSessionDownloadTask *task =
         [self.session downloadTaskWithRequest:request];
 
@@ -2390,6 +2487,7 @@ static NSString * const NFSeasonNotificationOutboxDefaultsKey =
         [[NFDownloadContext alloc] init];
 
     context.itemId = itemId;
+
 
     context.displayTitle =
         ([displayTitle isKindOfClass:[NSString class]] &&
@@ -2737,8 +2835,8 @@ static NSString * const NFSeasonNotificationOutboxDefaultsKey =
              */
             self.backgroundEventsFinishedAwaitingHandler =
                 self.backgroundStartupMayRegisterLateHandler &&
-                [UIApplication sharedApplication].applicationState ==
-                    UIApplicationStateBackground;
+                self.appInBackground;
+
         }
 
         self.backgroundWakeInProgress = NO;
@@ -2777,6 +2875,94 @@ static NSString * const NFSeasonNotificationOutboxDefaultsKey =
 
 #pragma mark - NSURLSessionTaskDelegate
 
+/*
+ * Errori di rete transitori e force-quit: invece di perdere il
+ * job ricreiamo il task (dai resume data se iOS li fornisce, così
+ * il download riprende dal punto raggiunto) nella stessa
+ * posizione FIFO. Annullamenti dell'utente ed errori HTTP no.
+ */
+- (BOOL)retryTask:(NSURLSessionTask *)task
+          context:(NFDownloadContext *)context
+            error:(NSError *)error {
+
+    if (!error || context.finalError || context.movedToDestination)
+        return NO;
+
+    if (![error.domain isEqualToString:NSURLErrorDomain])
+        return NO;
+
+    NSNumber *reason =
+        error.userInfo[NSURLErrorBackgroundTaskCancelledReasonKey];
+
+    BOOL forceQuit =
+        error.code == NSURLErrorCancelled &&
+        [reason isKindOfClass:[NSNumber class]] &&
+        reason.integerValue ==
+            NSURLErrorCancelledReasonUserForceQuitApplication;
+
+    BOOL transient =
+        error.code == NSURLErrorTimedOut ||
+        error.code == NSURLErrorNetworkConnectionLost ||
+        error.code == NSURLErrorNotConnectedToInternet ||
+        error.code == NSURLErrorCannotConnectToHost ||
+        error.code == NSURLErrorCannotFindHost ||
+        error.code == NSURLErrorDNSLookupFailed;
+
+    if (!forceQuit && !(transient && context.retryCount < 3))
+        return NO;
+
+    NSData *resumeData =
+        error.userInfo[NSURLSessionDownloadTaskResumeData];
+
+    NSURLSessionDownloadTask *retry = nil;
+
+    if ([resumeData isKindOfClass:[NSData class]] &&
+        resumeData.length) {
+        retry = [self.session downloadTaskWithResumeData:resumeData];
+    }
+
+    if (!retry && task.originalRequest) {
+        retry = [self.session
+            downloadTaskWithRequest:task.originalRequest];
+    }
+
+    if (!retry)
+        return NO;
+
+    retry.taskDescription = task.taskDescription;
+
+    NFDownloadContext *next = [[NFDownloadContext alloc] init];
+    next.itemId = context.itemId;
+    next.displayTitle = context.displayTitle;
+    next.destinationURL = context.destinationURL;
+    next.progressBlock = context.progressBlock;
+    next.completionBlock = context.completionBlock;
+    next.task = retry;
+    next.progress = resumeData.length ? context.progress : 0.0;
+    next.queued = YES;
+    next.queueSequence = context.queueSequence;
+    next.retryCount = context.retryCount + (forceQuit ? 0 : 1);
+
+    @synchronized (self.contexts) {
+        [self.contexts removeObjectForKey:@(task.taskIdentifier)];
+        self.contexts[@(retry.taskIdentifier)] = next;
+        [self rebuildQueueOrderLocked];
+    }
+
+    [self persistPendingQueueManifest];
+
+    NSLog(
+        @"NineFin download retry %@ (%@, attempt %ld, %@)",
+        context.itemId,
+        forceQuit ? @"force-quit" : @"network",
+        (long)next.retryCount,
+        resumeData.length ? @"resume data" : @"from start");
+
+    [self startNextDownloadIfNeeded];
+
+    return YES;
+}
+
 - (void)URLSession:(NSURLSession *)session
               task:(NSURLSessionTask *)task
  didCompleteWithError:(NSError *)error {
@@ -2784,8 +2970,14 @@ static NSString * const NFSeasonNotificationOutboxDefaultsKey =
     NFDownloadContext *context =
         [self contextForTask:task];
 
+    if (context &&
+        [self retryTask:task context:context error:error]) {
+        return;
+    }
+
     NSNumber *identifier =
         @(task.taskIdentifier);
+
 
     @synchronized (self.contexts) {
 

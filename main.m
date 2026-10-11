@@ -2669,8 +2669,13 @@ static NSURL *NFDownloadArtworkURL(
         attributes:nil
         error:NULL];
 
+    // Copertine rigenerabili: fuori dal backup come i video.
+    [directory setResourceValue:@YES
+        forKey:NSURLIsExcludedFromBackupKey error:NULL];
+
     NSString *base =
         [filename stringByDeletingPathExtension];
+
 
     return [directory URLByAppendingPathComponent:
         [base stringByAppendingPathExtension:@"jpg"]];
