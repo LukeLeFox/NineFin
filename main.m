@@ -13,6 +13,32 @@ static NSString *NFToken;
 static NSString *NFUser;
 static NSCache *NFImageCache;
 
+/*
+ * Cache poster condivisa. Su 512 MB di RAM serve un limite
+ * (costo = byte decodificati); NSCache si svuota anche da sola
+ * sotto pressione, il memory warning lo fa subito.
+ */
+static NSCache *NFSharedImageCache(void) {
+    if (!NFImageCache) {
+        NFImageCache = [[NSCache alloc] init];
+        NFImageCache.totalCostLimit = 24 * 1024 * 1024;
+
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:
+                UIApplicationDidReceiveMemoryWarningNotification
+            object:nil queue:[NSOperationQueue mainQueue]
+            usingBlock:^(NSNotification *note) {
+                [NFImageCache removeAllObjects];
+            }];
+    }
+    return NFImageCache;
+}
+
+static NSUInteger NFImageCost(UIImage *image) {
+    return (NSUInteger)(image.size.width * image.scale *
+                        image.size.height * image.scale * 4);
+}
+
 static NSInteger NFStreamingBitrate(void) {
     NSInteger b = [[NSUserDefaults standardUserDefaults]
         integerForKey:@"NineFin.StreamingBitrate"];
@@ -1980,10 +2006,12 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
     cell.imageView.image = nil;
     cell.accessibilityIdentifier = itemId;
 
-    if (!NFImageCache)
-        NFImageCache = [[NSCache alloc] init];
+    // Chiave per dimensione: le miniature da 120 px non devono
+    // finire nella scheda dettagli (260 px) e viceversa.
+    NSString *cacheKey = [itemId stringByAppendingString:@"@120"];
 
-    UIImage *cached = [NFImageCache objectForKey:itemId];
+    UIImage *cached = itemId.length
+        ? [NFSharedImageCache() objectForKey:cacheKey] : nil;
     if (cached) {
         cell.imageView.image = cached;
         return cell;
@@ -2014,7 +2042,8 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
         UIImage *image = [UIImage imageWithData:data];
         if (!image) return;
 
-        [NFImageCache setObject:image forKey:itemId];
+        [NFSharedImageCache() setObject:image forKey:cacheKey
+            cost:NFImageCost(image)];
 
         dispatch_async(dispatch_get_main_queue(), ^{
             UITableViewCell *target = weakCell;
@@ -2099,8 +2128,33 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
                 @"Context": @"Streaming"
             }
         ],
-        @"CodecProfiles": @[]
+        /*
+         * Limiti del decoder H.264 dei SoC A5/A5X/A6 (iPad mini 1,
+         * iPhone 4S, iPad 2/3): High profile fino al livello 4.1 e
+         * 1080p. Jellyfin li applica anche all'output del transcode.
+         */
+        @"CodecProfiles": @[
+            @{
+                @"Type": @"Video",
+                @"Codec": @"h264",
+                @"Conditions": @[
+                    @{ @"Condition": @"LessThanEqual",
+                       @"Property": @"VideoLevel",
+                       @"Value": @"41",
+                       @"IsRequired": @NO },
+                    @{ @"Condition": @"LessThanEqual",
+                       @"Property": @"Width",
+                       @"Value": @"1920",
+                       @"IsRequired": @NO },
+                    @{ @"Condition": @"LessThanEqual",
+                       @"Property": @"Height",
+                       @"Value": @"1080",
+                       @"IsRequired": @NO }
+                ]
+            }
+        ]
     };
+
 
     NSMutableDictionary *effectiveProfile =
         [profile mutableCopy];
@@ -2596,10 +2650,9 @@ static void NFPoster(NSString *itemId, UIImageView *view) {
 
     view.accessibilityIdentifier = itemId;
 
-    if (!NFImageCache)
-        NFImageCache = [[NSCache alloc] init];
+    NSString *cacheKey = [itemId stringByAppendingString:@"@260"];
 
-    UIImage *cached = [NFImageCache objectForKey:itemId];
+    UIImage *cached = [NFSharedImageCache() objectForKey:cacheKey];
     if (cached) {
         view.image = cached;
         return;
@@ -2628,7 +2681,8 @@ static void NFPoster(NSString *itemId, UIImageView *view) {
             UIImage *image = [UIImage imageWithData:data];
             if (!image) return;
 
-            [NFImageCache setObject:image forKey:itemId];
+            [NFSharedImageCache() setObject:image forKey:cacheKey
+                cost:NFImageCost(image)];
 
             dispatch_async(dispatch_get_main_queue(), ^{
                 UIImageView *target = weakView;
@@ -3481,6 +3535,31 @@ NFEnqueueOriginalDownloadForItem(
 }
 
 
+/*
+ * Target debole per NSTimer (il timer trattiene il target):
+ * la Home può essere deallocata anche con il timer attivo.
+ * I timer a blocchi esistono solo da iOS 10.
+ */
+@interface NFWeakTimerTarget : NSObject
+@property (weak, nonatomic) id target;
+@property (assign, nonatomic) SEL selector;
+@end
+
+@implementation NFWeakTimerTarget
+- (void)fire:(NSTimer *)timer {
+    id target = self.target;
+    if (!target) {
+        [timer invalidate];
+        return;
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    [target performSelector:self.selector withObject:timer];
+#pragma clang diagnostic pop
+}
+@end
+
+
 @interface NFHomeController : NFLibraryController
 @property (strong, nonatomic) NSArray *resumeItems;
 @property (strong, nonatomic) NSArray *nextItems;
@@ -3564,12 +3643,17 @@ NFEnqueueOriginalDownloadForItem(
     });
 
     if (!self.refreshTimer) {
+        NFWeakTimerTarget *proxy = [[NFWeakTimerTarget alloc] init];
+        proxy.target = self;
+        proxy.selector = @selector(NFHomeAutoRefresh:);
+
         self.refreshTimer =
             [NSTimer scheduledTimerWithTimeInterval:60.0
-            target:self
-            selector:@selector(NFHomeAutoRefresh:)
+            target:proxy
+            selector:@selector(fire:)
             userInfo:nil repeats:YES];
     }
+
 
     if (self.hasAppeared)
         [self reloadItems];
@@ -3798,6 +3882,9 @@ NFEnqueueOriginalDownloadForItem(
             [filtered addObject:item];
         }
 
+        // Dati identici: niente ricostruzione dell'header.
+        if ([filtered isEqualToArray:self.resumeItems]) return;
+
         self.resumeItems = filtered;
         [self renderResume];
     });
@@ -3837,6 +3924,14 @@ NFEnqueueOriginalDownloadForItem(
                 generation:generation server:server user:user];
             return;
         }
+
+        NSArray *previous =
+            kind == 1 ? self.nextItems :
+            kind == 2 ? self.recentMovies :
+            kind == 3 ? self.recentSeries : nil;
+
+        // Dati identici: niente ricostruzione dell'header.
+        if (previous && [previous isEqualToArray:items]) return;
 
         switch (kind) {
             case 1: self.nextItems = items; break;
