@@ -475,7 +475,15 @@ static void NFRecordOfflinePosition(NSString *filename,
 @property (strong, nonatomic) NSArray *activeDownloads;
 @property (strong, nonatomic) NSTimer *downloadRefreshTimer;
 @property (assign, nonatomic) BOOL onlineMode;
+// Testata coda: ricostruita solo se cambiano voci o larghezza,
+// altrimenti si aggiornano in place testo e barra.
+@property (copy, nonatomic) NSString *headerSignature;
+@property (strong, nonatomic) NSMutableArray *headerStatusLabels;
+@property (strong, nonatomic) NSMutableArray *headerFills;
+@property (strong, nonatomic) NSMutableArray *headerBarWidths;
 @end
+
+static const NSUInteger NFMaxQueueCards = 5;
 
 @implementation NFDownloadsController
 
@@ -504,6 +512,21 @@ static void NFRecordOfflinePosition(NSString *filename,
     [super viewDidLoad];
 
     self.title = @"Scaricati";
+
+    /*
+     * Il restore della sessione background è asincrono: senza
+     * questi observer la coda non compare se all'apertura era
+     * ancora vuota.
+     */
+    for (NSString *name in @[
+            NFDownloadManagerQueueDidChangeNotification,
+            NFDownloadManagerDidCompleteNotification]) {
+        [[NSNotificationCenter defaultCenter]
+            addObserver:self
+            selector:@selector(downloadManagerChanged:)
+            name:name
+            object:nil];
+    }
 
     if (self.openOnlineHandler) {
         self.navigationItem.leftBarButtonItem =
@@ -745,6 +768,32 @@ static void NFRecordOfflinePosition(NSString *filename,
 }
 
 
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
+
+- (void)downloadManagerChanged:(NSNotification *)note {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self.isViewLoaded || !self.view.window)
+            return;
+
+        [self refreshDownloadUI];
+
+        if (self.activeDownloads.count &&
+            !self.downloadRefreshTimer) {
+            self.downloadRefreshTimer =
+                [NSTimer
+                    scheduledTimerWithTimeInterval:1.0
+                    target:self
+                    selector:@selector(refreshDownloadUI)
+                    userInfo:nil
+                    repeats:YES];
+        }
+    });
+}
+
+
 - (void)refreshDownloadUI {
 
     NFDownloadManager *manager =
@@ -831,6 +880,8 @@ static void NFRecordOfflinePosition(NSString *filename,
         self.tableView.tableHeaderView =
             nil;
 
+        self.headerSignature = nil;
+
         return;
     }
 
@@ -839,15 +890,66 @@ static void NFRecordOfflinePosition(NSString *filename,
         CGRectGetWidth(
             self.tableView.bounds);
 
+    NSUInteger shown =
+        MIN(downloads.count, NFMaxQueueCards);
+
+    NSMutableString *signature =
+        [NSMutableString stringWithFormat:@"%.0f|%lu",
+            width, (unsigned long)downloads.count];
+
+    for (NSUInteger i = 0; i < shown; i++) {
+        NSDictionary *d = downloads[i];
+        [signature appendFormat:@"|%@:%d",
+            d[@"filename"] ?: @"",
+            [d[@"queued"] boolValue]];
+    }
+
+    if (self.tableView.tableHeaderView &&
+        [signature isEqualToString:self.headerSignature] &&
+        self.headerStatusLabels.count == shown) {
+
+        // Stesse voci: aggiorniamo solo percentuale e barra.
+        for (NSUInteger i = 0; i < shown; i++) {
+            NSDictionary *d = downloads[i];
+            if ([d[@"queued"] boolValue]) continue;
+
+            double f = [d[@"progress"] doubleValue];
+            if (!isfinite(f) || f < 0.0) f = 0.0;
+            if (f > 1.0) f = 1.0;
+
+            UILabel *label = self.headerStatusLabels[i];
+            label.text = [NSString stringWithFormat:
+                @"Download in corso · %ld%%",
+                (long)(f * 100.0)];
+
+            UIView *fill = self.headerFills[i];
+            CGRect frame = fill.frame;
+            frame.size.width =
+                [self.headerBarWidths[i] doubleValue] * f;
+            fill.frame = frame;
+        }
+
+        return;
+    }
+
+    self.headerSignature = signature;
+    self.headerStatusLabels = [NSMutableArray array];
+    self.headerFills = [NSMutableArray array];
+    self.headerBarWidths = [NSMutableArray array];
+
     CGFloat titleHeight =
         34.0;
 
     CGFloat rowHeight =
         74.0;
 
+    NSUInteger hidden =
+        downloads.count - shown;
+
     CGFloat height =
         titleHeight +
-        rowHeight * downloads.count +
+        rowHeight * shown +
+        (hidden ? 26.0 : 0.0) +
         8.0;
 
 
@@ -875,7 +977,11 @@ static void NFRecordOfflinePosition(NSString *filename,
                 22)];
 
     heading.text =
-        @"CODA DOWNLOAD";
+        downloads.count > 1
+            ? [NSString stringWithFormat:
+                @"CODA DOWNLOAD · %lu",
+                (unsigned long)downloads.count]
+            : @"CODA DOWNLOAD";
 
     heading.textColor =
         [UIColor colorWithRed:0.63
@@ -890,7 +996,7 @@ static void NFRecordOfflinePosition(NSString *filename,
 
 
     for (NSUInteger i = 0;
-         i < downloads.count;
+         i < shown;
          i++) {
 
         NSDictionary *download =
@@ -1113,12 +1219,44 @@ static void NFRecordOfflinePosition(NSString *filename,
         [card addSubview:track];
 
         [header addSubview:card];
+
+        [self.headerStatusLabels addObject:status];
+        [self.headerFills addObject:fill];
+        [self.headerBarWidths addObject:@(barWidth)];
+    }
+
+
+    if (hidden) {
+        UILabel *more =
+            [[UILabel alloc]
+                initWithFrame:CGRectMake(
+                    15,
+                    titleHeight + rowHeight * shown,
+                    width - 30,
+                    20)];
+
+        more.text =
+            [NSString stringWithFormat:
+                @"e altri %lu in attesa",
+                (unsigned long)hidden];
+
+        more.textColor =
+            [UIColor colorWithRed:0.63
+                            green:0.69
+                             blue:0.76
+                            alpha:1];
+
+        more.font =
+            [UIFont systemFontOfSize:12];
+
+        [header addSubview:more];
     }
 
 
     self.tableView.tableHeaderView =
         header;
 }
+
 
 
 - (void)cancelActiveDownload:(UIButton *)sender {
@@ -1282,8 +1420,20 @@ static void NFRecordOfflinePosition(NSString *filename,
     NSUserDefaults *defaults =
         [NSUserDefaults standardUserDefaults];
 
-    [defaults removeObjectForKey:
-        NFOfflineMetaKey(filename)];
+    NSString *metaKey = NFOfflineMetaKey(filename);
+    NSDictionary *meta = [defaults dictionaryForKey:metaKey];
+
+    if ([meta[@"offlineDirty"] boolValue]) {
+        /*
+         * Progresso o "visto" non ancora inviato a Jellyfin:
+         * teniamo il record per la sync, che lo rimuoverà dopo.
+         */
+        NSMutableDictionary *orphan = [meta mutableCopy];
+        orphan[@"orphaned"] = @YES;
+        [defaults setObject:orphan forKey:metaKey];
+    } else {
+        [defaults removeObjectForKey:metaKey];
+    }
 
     [defaults removeObjectForKey:
         [@"NineFin.OfflineResume."
@@ -1291,6 +1441,7 @@ static void NFRecordOfflinePosition(NSString *filename,
 
     [defaults synchronize];
 }
+
 
 
 - (void)deleteURLs:(NSArray *)urls {

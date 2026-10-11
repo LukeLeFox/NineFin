@@ -703,7 +703,7 @@ NFPendingOfflineSyncEntries(void) {
 
 
 static void __attribute__((unused))
-NFClearOfflinePending(NSString *key) {
+NFClearOfflinePending(NSString *key, id syncedUpdatedAt) {
 
     if (!key.length)
         return;
@@ -718,8 +718,27 @@ NFClearOfflinePending(NSString *key) {
             [NSDictionary class]])
         return;
 
+    /*
+     * Una riproduzione offline ha aggiornato il record mentre la
+     * richiesta era in volo: resta pending per il giro successivo.
+     */
+    id current = old[@"offlineUpdatedAt"];
+    if (current && syncedUpdatedAt &&
+        ![current isEqual:syncedUpdatedAt]) {
+        NSLog(@"NineFin offline sync: newer local progress kept");
+        return;
+    }
+
+    // File già eliminato: il record serviva solo per la sync.
+    if ([old[@"orphaned"] boolValue]) {
+        [defaults removeObjectForKey:key];
+        [defaults synchronize];
+        return;
+    }
+
     NSMutableDictionary *meta =
         [old mutableCopy];
+
 
     [meta removeObjectForKey:
         @"offlineDirty"];
@@ -943,7 +962,7 @@ NFOfflineSyncOne(
          */
         if (serverPlayed) {
 
-            NFClearOfflinePending(key);
+            NFClearOfflinePending(key, meta[@"offlineUpdatedAt"]);
 
             if (completion)
                 completion(NO, YES);
@@ -978,7 +997,7 @@ NFOfflineSyncOne(
                          @"marked played",
                         itemId);
 
-                    NFClearOfflinePending(key);
+                    NFClearOfflinePending(key, meta[@"offlineUpdatedAt"]);
 
                     if (completion)
                         completion(YES, NO);
@@ -1015,7 +1034,7 @@ NFOfflineSyncOne(
                                  @"marked played legacy",
                                 itemId);
 
-                            NFClearOfflinePending(key);
+                            NFClearOfflinePending(key, meta[@"offlineUpdatedAt"]);
 
                             if (completion)
                                 completion(YES, NO);
@@ -1057,7 +1076,7 @@ NFOfflineSyncOne(
          */
         if (localTicks <= 0) {
 
-            NFClearOfflinePending(key);
+            NFClearOfflinePending(key, meta[@"offlineUpdatedAt"]);
 
             if (completion)
                 completion(NO, YES);
@@ -1077,7 +1096,7 @@ NFOfflineSyncOne(
                  @"server already ahead",
                 itemId);
 
-            NFClearOfflinePending(key);
+            NFClearOfflinePending(key, meta[@"offlineUpdatedAt"]);
 
             if (completion)
                 completion(NO, YES);
@@ -1127,7 +1146,7 @@ NFOfflineSyncOne(
                  @"position uploaded",
                 itemId);
 
-            NFClearOfflinePending(key);
+            NFClearOfflinePending(key, meta[@"offlineUpdatedAt"]);
 
             if (completion)
                 completion(YES, NO);
@@ -2990,16 +3009,17 @@ static void NFSaveDownloadMetadata(
     if ([series isKindOfClass:[NSString class]])
         meta[@"series"] = series;
 
-    if (item[@"ParentIndexNumber"])
+    // Solo NSNumber/NSString: un NSNull farebbe fallire NSUserDefaults.
+    if ([item[@"ParentIndexNumber"] isKindOfClass:[NSNumber class]])
         meta[@"season"] = item[@"ParentIndexNumber"];
 
-    if (item[@"IndexNumber"])
+    if ([item[@"IndexNumber"] isKindOfClass:[NSNumber class]])
         meta[@"episode"] = item[@"IndexNumber"];
 
-    if (item[@"RunTimeTicks"])
+    if ([item[@"RunTimeTicks"] isKindOfClass:[NSNumber class]])
         meta[@"runtimeTicks"] = item[@"RunTimeTicks"];
 
-    if (item[@"Id"])
+    if ([item[@"Id"] isKindOfClass:[NSString class]])
         meta[@"itemId"] = item[@"Id"];
 
     if (NFServer.length)
@@ -3008,9 +3028,26 @@ static void NFSaveDownloadMetadata(
     if (NFUser.length)
         meta[@"user"] = NFUser;
 
+    /*
+     * Riscaricando un file non perdiamo progresso o "visto"
+     * ancora da sincronizzare con Jellyfin.
+     */
+    NSDictionary *old = [[NSUserDefaults standardUserDefaults]
+        dictionaryForKey:NFDownloadMetadataKey(filename)];
+
+    if ([old[@"offlineDirty"] boolValue]) {
+        for (NSString *k in @[@"offlineDirty",
+                              @"offlinePositionTicks",
+                              @"offlinePlayed",
+                              @"offlineUpdatedAt"]) {
+            if (old[k]) meta[k] = old[k];
+        }
+    }
+
     [[NSUserDefaults standardUserDefaults]
         setObject:meta
         forKey:NFDownloadMetadataKey(filename)];
+
 
     [[NSUserDefaults standardUserDefaults]
         synchronize];
